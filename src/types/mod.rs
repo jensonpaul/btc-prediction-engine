@@ -6,9 +6,11 @@
 
 pub mod tick_store;
 pub mod pred_store;
+pub mod order_book;
 
 pub use tick_store::TickStore;
 pub use pred_store::PredictionStore;
+pub use order_book::{BookSnapshot, Level, BOOK_DEPTH};
 
 use std::fmt;
 use chrono::{DateTime, Utc};

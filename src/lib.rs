@@ -1,4 +1,4 @@
-//! # `btc_prediction_engine` v0.2
+//! # `btc_prediction_engine` v0.3
 //!
 //! Continuous, lock-free BTC/USD prediction engine — multi-exchange,
 //! multi-scale, fully async non-blocking.
@@ -6,30 +6,39 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │  Exchange feeds — 4 independent tokio tasks                     │
-//! │  Binance (btcusdt) · Coinbase (BTC-USD) ·                       │
-//! │  Kraken (BTC/USD)  · Bitstamp (btcusd)                          │
-//! └──────────────────────┬──────────────────────────────────────────┘
-//!                        │ mpsc::Sender<Tick>  (bounded, non-blocking)
+//! ┌──────────────────────────────────────────────────────────────────────┐
+//! │  Trade feeds — 4 independent tokio tasks                             │
+//! │  Binance (btcusdt) · Coinbase (BTC-USD) ·                            │
+//! │  Kraken (BTC/USD)  · Bitstamp (btcusd)                               │
+//! └──────────────────────┬───────────────────────────────────────────────┘
+//!                        │ mpsc::Sender<Tick>
 //!                        ▼
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │  Pipeline — 4 concurrent async stages                           │
-//! │                                                                 │
-//! │  [1] Dedup + Outlier filter                                     │
-//! │        cross-exchange dedup · spike rejection                   │
-//! │        │                                                        │
-//! │  [2] Feature engineering                                        │
-//! │        RSI · VWAP · OFI · momentum · autocorr · realised vol   │
-//! │        inter-exchange spread · tick velocity (all incremental)  │
-//! │        │                                                        │
-//! │  [3] Model inference  (parallel via tokio::join! / FuturesUnordered) │
-//! │        EMA multi-scale · heuristic classifier · signal fuser   │
-//! │        momentum extrapolator (or plug-in LSTM / XGBoost)        │
-//! │        │                                                        │
-//! │  [4] Fanout                                                     │
-//! │        ArcSwap<snapshot> · PredictionStore · broadcast channel  │
-//! └──────────────────────┬──────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────────────────┐
+//! │  Book feeds — 3 independent tokio tasks              ─────────────┐  │
+//! │  Binance · Kraken · Bitstamp  (@depth10@100ms)                    │  │
+//! └───────────────────────────────────────────────┬───────────────────┘  │
+//!                                                 │ mpsc::Sender<BookSnapshot>
+//!                                                 │                       │
+//! ┌───────────────────────────────────────────────┼───────────────────────┘
+//! │  Pipeline — 5 concurrent async stages         │
+//! │                                               │
+//! │  [1] Dedup + Outlier filter  ◄── Tick         │
+//! │        cross-exchange dedup · spike rejection  │
+//! │        │                                       │
+//! │  [1.5] Price fusion                            │
+//! │        NTP drift correction · 100 ms VWAP     │
+//! │        │                                       │
+//! │  [2] Feature engineering  ◄───────────────────┘ BookSnapshot
+//! │        RSI · VWAP · OFI · momentum · autocorr · realised vol
+//! │        book_imbalance_top5 · book_imbalance_full (all incremental)
+//! │        │
+//! │  [3] Model inference  (parallel via tokio::join!)
+//! │        EMA multi-scale · heuristic classifier · signal fuser
+//! │        momentum extrapolator (or plug-in LSTM / XGBoost)
+//! │        │
+//! │  [4] Fanout
+//! │        ArcSwap<snapshot> · PredictionStore · broadcast channel
+//! └──────────────────────┬───────────────────────────────────────────────┘
 //!                        │
 //!        ┌───────────────┼───────────────────┐
 //!        │               │                   │
@@ -46,11 +55,15 @@
 //! async fn main() {
 //!     let (engine, _handles) = PredictionEngine::start(EngineConfig::default()).await;
 //!
-//!     // Attach feeds (all public — no API key needed except Coinbase)
+//!     // Trade feeds (all public — no API key needed except Coinbase)
 //!     engine.add_feed(FeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
 //!     engine.add_feed(FeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
 //!     engine.add_feed(FeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
-//!     // Coinbase: engine.add_feed(FeedConfig::authenticated(Exchange::Coinbase, Symbol::BtcUsd, key, secret));
+//!
+//!     // Order book feeds — top-5 bid/ask imbalance, highest-signal sub-minute feature
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
 //!
 //!     // Push subscription
 //!     let mut rx = engine.subscribe();
@@ -85,10 +98,10 @@
 //!
 //! | Flag | Default | Effect |
 //! |---|---|---|
-//! | `feeds-binance`  | on | Binance feed |
-//! | `feeds-coinbase` | on | Coinbase feed (requires JWT credentials) |
-//! | `feeds-kraken`   | on | Kraken feed |
-//! | `feeds-bitstamp` | on | Bitstamp feed |
+//! | `feeds-binance`  | on | Binance trade + book feeds |
+//! | `feeds-coinbase` | on | Coinbase trade feed (requires JWT credentials) |
+//! | `feeds-kraken`   | on | Kraken trade + book feeds |
+//! | `feeds-bitstamp` | on | Bitstamp trade + book feeds |
 //! | `metrics`        | off | Prometheus `/metrics` endpoint |
 //! | `tracing`        | off | `tracing` crate instrumentation |
 //! | `persistence`    | off | Snapshot save/load (bincode + zstd) |
@@ -129,11 +142,12 @@ pub mod query;
 /// Everything you need for typical usage — `use btc_prediction_engine::prelude::*`.
 pub mod prelude {
     pub use crate::engine::{EngineConfig, EngineHandles, PredictionEngine};
-    pub use crate::feeds::FeedConfig;
+    pub use crate::feeds::{BookFeedConfig, FeedConfig};
     pub use crate::pipeline::PipelineConfig;
     pub use crate::price_fusion::{FusedTick, FusionConfig};
     pub use crate::query::QueryEngine;
     pub use crate::types::{
+        BookSnapshot,
         EngineError, EngineResult,
         EngineMetrics,
         Exchange, Symbol,

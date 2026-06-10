@@ -5,11 +5,19 @@ pub mod coinbase;
 pub mod kraken;
 pub mod bitstamp;
 
+// ── Order book feeds (Binance, Kraken, Bitstamp) ─────────────────────────────
+#[cfg(feature = "feeds-binance")]
+pub mod binance_book;
+#[cfg(feature = "feeds-kraken")]
+pub mod kraken_book;
+#[cfg(feature = "feeds-bitstamp")]
+pub mod bitstamp_book;
+
 use std::time::Duration;
 use tokio::sync::mpsc;
-use crate::types::{EngineResult, Exchange, Symbol, Tick};
+use crate::types::{BookSnapshot, EngineResult, Exchange, Symbol, Tick};
 
-// ─── Feed configuration ───────────────────────────────────────────────────────
+// ─── Trade feed configuration ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
@@ -57,6 +65,25 @@ impl FeedConfig {
     /// Native exchange symbol string for this (exchange, symbol) pair.
     pub fn native_symbol(&self) -> &'static str {
         self.symbol.for_exchange(self.exchange)
+    }
+}
+
+// ─── Order book feed configuration ───────────────────────────────────────────
+
+/// Configuration for a Level 2 order book feed.
+///
+/// Wraps a [`FeedConfig`] (for shared reconnect / symbol logic) and adds any
+/// book-specific options.
+#[derive(Debug, Clone)]
+pub struct BookFeedConfig {
+    /// Shared trade/book feed settings (exchange, symbol, reconnect policy).
+    pub feed: FeedConfig,
+}
+
+impl BookFeedConfig {
+    /// Construct a public (unauthenticated) book feed config.
+    pub fn public(exchange: Exchange, symbol: Symbol) -> Self {
+        Self { feed: FeedConfig::public(exchange, symbol) }
     }
 }
 

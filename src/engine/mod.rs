@@ -3,7 +3,7 @@
 //! [`PredictionEngine`] wires together all subsystems:
 //!
 //! * Spawns exchange feeds as independent tokio tasks.
-//! * Owns the [`Pipeline`] (4 concurrent async stages).
+//! * Owns the [`Pipeline`] (5 concurrent async stages).
 //! * Exposes [`TickStore`] and [`PredictionStore`] for direct queries.
 //! * Provides a zero-lock [`latest_snapshot()`] via [`ArcSwap`].
 //! * Broadcasts every new [`PredictionSnapshot`] to N concurrent subscribers.
@@ -17,10 +17,15 @@
 //! async fn main() {
 //!     let (engine, _handles) = PredictionEngine::start(EngineConfig::default()).await;
 //!
-//!     // Attach feeds — synchronous, each spawns a background task
+//!     // Trade feeds
 //!     engine.add_feed(FeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
 //!     engine.add_feed(FeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
 //!     engine.add_feed(FeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
+//!
+//!     // Order book feeds (top-5 bid/ask imbalance — highest-signal sub-minute feature)
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+//!     engine.add_book_feed(BookFeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
 //!
 //!     // Subscribe to push updates
 //!     let mut rx = engine.subscribe();
@@ -48,10 +53,11 @@ use arc_swap::ArcSwap;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::feeds::FeedConfig;
+use crate::feeds::{BookFeedConfig, FeedConfig};
 use crate::pipeline::{Pipeline, PipelineConfig, PipelineHandles};
 use crate::types::{
-    Exchange, FeedHealth, PredictionSnapshot, Symbol, Tick, TickStore, PredictionStore,
+    BookSnapshot, Exchange, FeedHealth, PredictionSnapshot, Symbol, Tick,
+    TickStore, PredictionStore,
 };
 use crate::types::tick_store;
 use crate::types::pred_store;
@@ -92,7 +98,7 @@ impl EngineHandles {
     /// Await all tasks to completion (call after dropping the engine handle).
     pub async fn join_all(self) {
         let (p, feeds) = (self.pipeline, self.feeds.into_inner());
-        let _ = tokio::join!(p.dedup, p.fusion, p.feature, p.model, p.fanout);
+        let _ = tokio::join!(p.dedup, p.fusion, p.feature, p.model, p.fanout, p.book);
         for h in feeds { let _ = h.await; }
     }
 }
@@ -176,6 +182,54 @@ impl PredictionEngine {
                 crate::feeds::log_error(exchange, &format!("feed terminated: {e}"));
             }
         })
+    }
+
+    /// Spawn an order book feed.
+    ///
+    /// Book feeds operate independently of trade feeds — you can attach them
+    /// after trade feeds are already running. Each call spawns one tokio task
+    /// with its own reconnect loop.
+    ///
+    /// Coinbase does not offer a public order book WebSocket on the same
+    /// endpoint as the trade feed, so only Binance, Kraken, and Bitstamp are
+    /// supported here.
+    ///
+    /// ```rust,no_run
+    /// # use btc_prediction_engine::prelude::*;
+    /// # async fn example(engine: PredictionEngine) {
+    /// engine.add_book_feed(BookFeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+    /// engine.add_book_feed(BookFeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+    /// engine.add_book_feed(BookFeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
+    /// # }
+    /// ```
+    pub fn add_book_feed(&self, config: BookFeedConfig) -> JoinHandle<()> {
+        let tx       = self.inner.pipeline.book_tx.clone();
+        let exchange = config.feed.exchange;
+
+        tokio::spawn(async move {
+            let result = match exchange {
+                #[cfg(feature = "feeds-binance")]
+                Exchange::Binance  => crate::feeds::binance_book::run(config, tx).await,
+                #[cfg(feature = "feeds-kraken")]
+                Exchange::Kraken   => crate::feeds::kraken_book::run(config, tx).await,
+                #[cfg(feature = "feeds-bitstamp")]
+                Exchange::Bitstamp => crate::feeds::bitstamp_book::run(config, tx).await,
+                #[allow(unreachable_patterns)]
+                _ => Err(crate::types::EngineError::Other(
+                    anyhow::anyhow!("book feed not available for: {exchange:?}")
+                )),
+            };
+            if let Err(e) = result {
+                crate::feeds::log_error(exchange, &format!("book feed terminated: {e}"));
+            }
+        })
+    }
+
+    /// Inject a book snapshot directly (for testing or historical replay).
+    ///
+    /// Uses `try_send` — returns `false` if the channel is full.
+    pub fn inject_book_snapshot(&self, snap: BookSnapshot) -> bool {
+        self.inner.pipeline.book_tx.try_send(snap).is_ok()
     }
 
     /// Inject a tick directly (for testing or historical replay).

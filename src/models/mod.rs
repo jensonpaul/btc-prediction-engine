@@ -16,18 +16,34 @@
 //!
 //! ## Training feature vector
 //!
-//! The 13 features available in [`crate::features::FeatureVector`]:
+//! The 17 features available in [`crate::features::FeatureVector`]. The first
+//! 13 are always populated; book features (14–17) are `None` when no book feed
+//! is connected — substitute sensible defaults (shown in `feature_array` below).
+//!
 //! ```text
-//! [rsi_14, vwap_deviation, momentum_micro, momentum_short,
-//!  ewma_vol_tick, tick_velocity, ofi_30s, ofi_300s,
-//!  autocorr_lag1, realised_vol_30s, inter_exchange_spread,
-//!  price, ewma_variance]
+//!  1  rsi_14               – Wilder RSI, 14-tick period
+//!  2  vwap_deviation        – (price − session VWAP) / VWAP
+//!  3  momentum_micro        – (p_now − p_30ago) / p_30ago
+//!  4  momentum_short        – (p_now − p_300ago) / p_300ago
+//!  5  ewma_vol_tick         – per-tick EWMA σ
+//!  6  tick_velocity         – 30-s rolling tick rate (ticks/s)
+//!  7  ofi_30s               – order flow imbalance, 30 s  ∈ [−1, 1]
+//!  8  ofi_300s              – order flow imbalance, 300 s ∈ [−1, 1]
+//!  9  autocorr_lag1         – lag-1 return autocorrelation ∈ [−1, 1]
+//! 10  realised_vol_30s      – realised vol, 30-s window
+//! 11  inter_exchange_spread – max − min last price across exchanges (USD)
+//! 12  price                 – current BTC/USD (normalised in feature_array)
+//! 13  ewma_variance         – EWMA price variance
+//! 14  book_imbalance_top5   – top-5 bid/ask volume imbalance ∈ [−1, 1]
+//! 15  book_imbalance_full   – full-depth bid/ask imbalance ∈ [−1, 1]
+//! 16  book_weighted_mid     – volume-weighted mid-price (USD)
+//! 17  book_spread_usd       – best bid–ask spread (USD)
 //! ```
 //!
 //! ## Export helper (call from training code)
 //!
 //! ```rust,ignore
-//! pub fn feature_array(f: &FeatureVector) -> [f64; 13] {
+//! pub fn feature_array(f: &FeatureVector) -> [f64; 17] {
 //!     [
 //!         f.rsi_14.unwrap_or(50.0) / 100.0,
 //!         f.vwap_deviation.unwrap_or(0.0),
@@ -40,8 +56,13 @@
 //!         f.autocorr_lag1.unwrap_or(0.0),
 //!         f.realised_vol_30s.unwrap_or(0.001),
 //!         f.inter_exchange_spread / 100.0,
-//!         (f.price - 30_000.0) / 70_000.0,  // normalised BTC price
+//!         (f.price - 30_000.0) / 70_000.0,   // normalised BTC price
 //!         f.ewma_variance,
+//!         // Book features: default to 0.0 (neutral) when no book feed connected
+//!         f.book_imbalance_top5.unwrap_or(0.0),
+//!         f.book_imbalance_full.unwrap_or(0.0),
+//!         f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0),
+//!         f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0),
 //!     ]
 //! }
 //! ```

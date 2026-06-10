@@ -50,7 +50,7 @@ use crate::models::{
 };
 use crate::price_fusion::{run_fuser, FusedTick, FusionConfig};
 use crate::types::{
-    EngineMetrics, Exchange, FeedHealth, PredictionSnapshot, ShortTermForecast,
+    BookSnapshot, EngineMetrics, Exchange, FeedHealth, PredictionSnapshot, ShortTermForecast,
     TimeScale, Tick, TickStore, TrendDirection, TrendSignal, PredictionStore,
 };
 
@@ -66,6 +66,8 @@ pub const FUSED_CHANNEL_CAP: usize = 16_384;
 pub const FEAT_CHANNEL_CAP: usize = 8_192;
 /// Snapshots → fanout stage.
 pub const SNAP_CHANNEL_CAP: usize = 4_096;
+/// Book snapshots from all book feeds → book feature stage.
+pub const BOOK_CHANNEL_CAP: usize = 8_192;
 
 // ─── Pipeline configuration ──────────────────────────────────────────────────
 
@@ -202,12 +204,16 @@ pub struct PipelineHandles {
     pub feature: JoinHandle<()>,
     pub model:   JoinHandle<()>,
     pub fanout:  JoinHandle<()>,
+    /// Book feature stage — feeds [`BookSnapshot`]s into [`FeatureState`].
+    pub book:    JoinHandle<()>,
 }
 
 /// Channels and handles for the live pipeline.
 pub struct Pipeline {
     /// Send raw ticks from feeds into the pipeline.
     pub raw_tx:       mpsc::Sender<Tick>,
+    /// Send book snapshots from book feeds into the book stage.
+    pub book_tx:      mpsc::Sender<BookSnapshot>,
     /// Subscribe to prediction snapshots.
     pub broadcast_tx: broadcast::Sender<PredictionSnapshot>,
     pub health:       FeedHealthTracker,
@@ -223,6 +229,7 @@ impl Pipeline {
         latest_snap: Arc<arc_swap::ArcSwap<Option<PredictionSnapshot>>>,
     ) -> (Self, PipelineHandles) {
         let (raw_tx,   raw_rx)   = mpsc::channel::<Tick>(RAW_CHANNEL_CAP);
+        let (book_tx,  book_rx)  = mpsc::channel::<BookSnapshot>(BOOK_CHANNEL_CAP);
         let (clean_tx, clean_rx) = mpsc::channel::<Tick>(CLEAN_CHANNEL_CAP);
         let (fused_tx, fused_rx) = mpsc::channel::<FusedTick>(FUSED_CHANNEL_CAP);
         let (feat_tx,  feat_rx)  = mpsc::channel::<FeatureVector>(FEAT_CHANNEL_CAP);
@@ -247,10 +254,13 @@ impl Pipeline {
             })
         };
 
-        // ── Stage 2: feature engineering ────────────────────────────────────
+        // ── Stage 2: feature engineering + book ─────────────────────────────
+        // Book snapshots and fused ticks share the same FeatureState, so they
+        // are handled in a single task via tokio::select!. Book updates update
+        // the imbalance tracker only; fused ticks produce a FeatureVector.
         let feature_handle = {
             tokio::spawn(async move {
-                stage_features(fused_rx, feat_tx).await;
+                stage_features(fused_rx, book_rx, feat_tx).await;
             })
         };
 
@@ -278,13 +288,15 @@ impl Pipeline {
         };
 
         (
-            Self { raw_tx, broadcast_tx: bcast_tx, health },
+            Self { raw_tx, book_tx, broadcast_tx: bcast_tx, health },
             PipelineHandles {
                 dedup:   dedup_handle,
                 fusion:  fusion_handle,
                 feature: feature_handle,
                 model:   model_handle,
                 fanout:  fanout_handle,
+                book:    tokio::spawn(async {}), // book feeds push directly into book_tx;
+                                                 // no dedicated drain task needed
             },
         )
     }
@@ -322,20 +334,39 @@ async fn stage_dedup(
     }
 }
 
-// ─── Stage 2: Feature engineering ────────────────────────────────────────────
-
+// ─── Stage 2: Feature engineering (fused ticks + book snapshots) ─────────────
+//
+// Both inputs share the same `FeatureState` so they must live in one task.
+// Book snapshots arrive ~10× more frequently than fused ticks (100 ms vs ~1 s)
+// and only update the `BookImbalanceTracker`; they do not emit a feature vector.
+// Fused ticks drive the feature vector output.
 async fn stage_features(
-    mut rx: mpsc::Receiver<FusedTick>,
-    tx:     mpsc::Sender<FeatureVector>,
+    mut fused_rx: mpsc::Receiver<FusedTick>,
+    mut book_rx:  mpsc::Receiver<BookSnapshot>,
+    tx:           mpsc::Sender<FeatureVector>,
 ) {
     let mut state = FeatureState::new();
 
-    while let Some(fused) = rx.recv().await {
-        let fv = state.update_from_fused(&fused);
+    loop {
+        tokio::select! {
+            // Bias toward fused ticks — the primary signal path.
+            biased;
 
-        if tx.try_send(fv).is_err() {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("btc_engine_pipeline_drops_total", "stage" => "features").increment(1);
+            Some(fused) = fused_rx.recv() => {
+                let fv = state.update_from_fused(&fused);
+                if tx.try_send(fv).is_err() {
+                    #[cfg(feature = "metrics")]
+                    metrics::counter!("btc_engine_pipeline_drops_total", "stage" => "features").increment(1);
+                }
+            }
+
+            Some(snap) = book_rx.recv() => {
+                // Update book imbalance tracker only — no feature vector emitted.
+                // The next fused tick will pick up the fresh imbalance values.
+                state.update_book(&snap);
+            }
+
+            else => break,
         }
     }
 }

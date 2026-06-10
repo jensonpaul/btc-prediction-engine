@@ -9,15 +9,21 @@ Ticks stream in from four exchanges. Every tick updates global state — no wind
 ## Architecture
 
 ```
-Binance ─┐
-Coinbase ─┤─► mpsc::Sender<Tick> ─► Pipeline (5 concurrent async stages)
-Kraken  ─┤
+Binance ─┐                           Binance ─┐
+Coinbase ─┤─► mpsc::Sender<Tick>     Kraken  ─┤─► mpsc::Sender<BookSnapshot>
+Kraken  ─┤                           Bitstamp─┘   (100 ms depth snapshots)
 Bitstamp─┘
-              Stage 1 │ Dedup + outlier filter
-              Stage 2 │ Price fusion (NTP drift correction + 100 ms VWAP)
-              Stage 3 │ Feature engineering (RSI, VWAP, OFI, momentum, …)
-              Stage 4 │ Model inference (parallel per TimeScale + forecasts)
-              Stage 5 │ Fanout → TickStore · PredictionStore · ArcSwap · broadcast
+              │                                         │
+              └──────────────┬──────────────────────────┘
+                             ▼
+              Pipeline (5 concurrent async stages)
+
+              Stage 1   │ Dedup + outlier filter
+              Stage 1.5 │ Price fusion (NTP drift correction + 100 ms VWAP)
+              Stage 2   │ Feature engineering — select! over fused ticks + book snapshots
+                        │   RSI, VWAP, OFI, momentum, book_imbalance_top5, …
+              Stage 3   │ Model inference (parallel per TimeScale + forecasts)
+              Stage 4   │ Fanout → TickStore · PredictionStore · ArcSwap · broadcast
 
                                     │
                     ┌───────────────┼───────────────────┐
@@ -92,6 +98,29 @@ The engine regenerates the JWT every 90 seconds automatically.
 
 ---
 
+## Order Book Feeds
+
+Binance, Kraken, and Bitstamp all expose a Level 2 depth feed on the same WebSocket connection as the trade feed. Attaching them enables the `book_imbalance_top5` and related features — the highest-signal features at sub-minute timescales.
+
+```rust
+// All three are public — no API key required
+engine.add_book_feed(BookFeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+engine.add_book_feed(BookFeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+engine.add_book_feed(BookFeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
+```
+
+Book feeds are optional. When none are connected, `book_imbalance_top5`, `book_imbalance_full`, `book_weighted_mid`, and `book_spread_usd` on `FeatureVector` are `None`. The rest of the engine runs normally.
+
+| Exchange | Stream | Update interval | Mechanism |
+|----------|--------|-----------------|-----------|
+| Binance  | `btcusdt@depth10@100ms` | 100 ms | Full snapshot pushed each update |
+| Kraken   | `book` channel, depth 10 | On change | Initial snapshot + incremental diffs |
+| Bitstamp | `order_book_btcusd` | On change | Full snapshot pushed each update |
+
+Coinbase Advanced Trade does not provide an equivalent public order book WebSocket.
+
+---
+
 ## Quick Start
 
 ```toml
@@ -113,6 +142,11 @@ async fn main() {
     engine.add_feed(FeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
     engine.add_feed(FeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
     engine.add_feed(FeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
+
+    // Order book feeds — top-5 bid/ask imbalance, highest-signal sub-minute feature
+    engine.add_book_feed(BookFeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+    engine.add_book_feed(BookFeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+    engine.add_book_feed(BookFeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
 
     // Subscribe to live prediction broadcast
     let mut rx = engine.subscribe();
@@ -225,11 +259,15 @@ All 13 fields available at inference time:
 | `autocorr_lag1`         | `Option<f64>` | [−1, 1]               | Lag-1 return autocorrelation        |
 | `realised_vol_30s`      | `Option<f64>` | fraction              | Realised volatility, 30-s window    |
 | `inter_exchange_spread` | `f64`         | USD                   | max − min last price per exchange   |
+| `book_imbalance_top5`   | `Option<f64>` | [−1, 1]               | Top-5 bid/ask volume imbalance      |
+| `book_imbalance_full`   | `Option<f64>` | [−1, 1]               | Full-depth bid/ask imbalance        |
+| `book_weighted_mid`     | `Option<f64>` | USD                   | Volume-weighted mid-price           |
+| `book_spread_usd`       | `Option<f64>` | USD                   | Best bid–ask spread                 |
 
 Export helper for training pipelines:
 
 ```rust
-pub fn feature_array(f: &FeatureVector) -> [f64; 13] {
+pub fn feature_array(f: &FeatureVector) -> [f64; 17] {
     [
         f.rsi_14.unwrap_or(50.0) / 100.0,
         f.vwap_deviation.unwrap_or(0.0),
@@ -244,6 +282,11 @@ pub fn feature_array(f: &FeatureVector) -> [f64; 13] {
         f.inter_exchange_spread / 100.0,
         (f.price - 30_000.0) / 70_000.0,   // normalised BTC price
         f.ewma_variance,
+        // Book features: 0.0 (neutral) when no book feed is connected
+        f.book_imbalance_top5.unwrap_or(0.0),
+        f.book_imbalance_full.unwrap_or(0.0),
+        f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0),
+        f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0),
     ]
 }
 ```

@@ -16,6 +16,10 @@
 //! | `realised_vol_30s` | fraction | Realised vol, 30-s window |
 //! | `inter_exchange_spread` | USD | max − min last price per exchange |
 //! | `price` | USD | Current BTC/USD price |
+//! | `book_imbalance_top5` | [−1, 1] | Top-5 bid/ask volume imbalance (book feeds) |
+//! | `book_imbalance_full` | [−1, 1] | Full-depth bid/ask volume imbalance (book feeds) |
+//! | `book_weighted_mid` | USD | Volume-weighted mid-price (book feeds) |
+//! | `book_spread_usd` | USD | Best bid–ask spread (book feeds) |
 
 use std::collections::{HashMap, VecDeque};
 use crate::types::{Exchange, Tick, TradeSide};
@@ -255,6 +259,53 @@ impl RealisedVol {
     }
 }
 
+// ─── Order book imbalance tracker ───────────────────────────────────────────
+
+/// Tracks the latest top-N book imbalance per exchange and fuses them into a
+/// single cross-exchange estimate.
+///
+/// Imbalance decays to `None` after [`BOOK_STALE_MICROS`] without an update —
+/// a stale snapshot is worse than no snapshot for short-timescale features.
+pub struct BookImbalanceTracker {
+    /// (imbalance ∈ [−1,1], received_at_micros) per exchange.
+    last: HashMap<Exchange, (f64, i64)>,
+}
+
+/// A book snapshot older than this is considered stale and excluded from the
+/// fused imbalance calculation.
+const BOOK_STALE_MICROS: i64 = 2_000_000; // 2 s
+
+impl BookImbalanceTracker {
+    pub fn new() -> Self { Self { last: HashMap::new() } }
+
+    /// Record a new snapshot for one exchange.
+    pub fn update(&mut self, exchange: Exchange, imbalance: f64, ts_micros: i64) {
+        self.last.insert(exchange, (imbalance, ts_micros));
+    }
+
+    /// Simple (bid_vol − ask_vol) imbalance for the most recent snapshot from
+    /// `exchange`. Returns `None` if no snapshot has been received or the
+    /// latest is stale.
+    pub fn latest_for(&self, exchange: Exchange, now_micros: i64) -> Option<f64> {
+        self.last.get(&exchange).and_then(|&(imb, ts)| {
+            if now_micros - ts <= BOOK_STALE_MICROS { Some(imb) } else { None }
+        })
+    }
+
+    /// Volume-averaged imbalance across all exchanges with a fresh snapshot.
+    ///
+    /// Returns `None` if no exchange has a fresh snapshot.
+    pub fn fused_imbalance(&self, now_micros: i64) -> Option<f64> {
+        let fresh: Vec<f64> = self.last.values()
+            .filter_map(|&(imb, ts)| {
+                if now_micros - ts <= BOOK_STALE_MICROS { Some(imb) } else { None }
+            })
+            .collect();
+        if fresh.is_empty() { return None; }
+        Some(fresh.iter().sum::<f64>() / fresh.len() as f64)
+    }
+}
+
 // ─── Inter-exchange spread tracker ───────────────────────────────────────────
 
 /// Tracks last price per exchange and computes the spread between them.
@@ -291,6 +342,17 @@ pub struct FeatureVector {
     pub autocorr_lag1:         Option<f64>,
     pub realised_vol_30s:      Option<f64>,
     pub inter_exchange_spread: f64,
+    // ── Order book features (None when no book feed is connected) ────────────
+    /// Fused top-5 bid/ask volume imbalance across all exchanges with a live
+    /// book feed. ∈ [−1, 1]: +1 = fully bid-side, −1 = fully ask-side.
+    pub book_imbalance_top5:   Option<f64>,
+    /// Same, but over all [`BOOK_DEPTH`] levels available.
+    pub book_imbalance_full:   Option<f64>,
+    /// Weighted mid-price derived from the book (more stable than last trade).
+    /// `None` when no book is connected.
+    pub book_weighted_mid:     Option<f64>,
+    /// Best bid–ask spread in USD. `None` when no book is connected.
+    pub book_spread_usd:       Option<f64>,
 }
 
 // ─── Feature state ───────────────────────────────────────────────────────────
@@ -310,22 +372,24 @@ pub struct FeatureState {
     pub autocorr:        ReturnAutocorr,
     pub realised_30:     RealisedVol,
     pub spread:          InterExchangeSpread,
+    pub book_imbalance:  BookImbalanceTracker,
 }
 
 impl FeatureState {
     pub fn new() -> Self {
         Self {
-            rsi:         IncrementalRsi::new(14),
-            vwap:        SessionVwap::new(),
-            vol:         EwmaVolatility::default_lambda(),
-            mom_micro:   RollingMomentum::new(30),
-            mom_short:   RollingMomentum::new(300),
-            velocity:    TickVelocity::new(30),
-            ofi_30:      OrderFlowImbalance::new(30),
-            ofi_300:     OrderFlowImbalance::new(300),
-            autocorr:    ReturnAutocorr::new(60),
-            realised_30: RealisedVol::new(30),
-            spread:      InterExchangeSpread::new(),
+            rsi:            IncrementalRsi::new(14),
+            vwap:           SessionVwap::new(),
+            vol:            EwmaVolatility::default_lambda(),
+            mom_micro:      RollingMomentum::new(30),
+            mom_short:      RollingMomentum::new(300),
+            velocity:       TickVelocity::new(30),
+            ofi_30:         OrderFlowImbalance::new(30),
+            ofi_300:        OrderFlowImbalance::new(300),
+            autocorr:       ReturnAutocorr::new(60),
+            realised_30:    RealisedVol::new(30),
+            spread:         InterExchangeSpread::new(),
+            book_imbalance: BookImbalanceTracker::new(),
         }
     }
 
@@ -346,8 +410,9 @@ impl FeatureState {
         self.realised_30.update(tick);
         self.spread.update(tick);
 
+        let ts = tick.ts_micros;
         FeatureVector {
-            ts_micros:             tick.ts_micros,
+            ts_micros:             ts,
             price:                 tick.price,
             rsi_14:                self.rsi.value(),
             vwap_deviation:        self.vwap.deviation(tick.price),
@@ -361,6 +426,21 @@ impl FeatureState {
             autocorr_lag1:         self.autocorr.value(),
             realised_vol_30s:      self.realised_30.value(),
             inter_exchange_spread: self.spread.spread(),
+            book_imbalance_top5:   self.book_imbalance.fused_imbalance(ts),
+            book_imbalance_full:   self.book_imbalance.fused_imbalance(ts),
+            book_weighted_mid:     None,
+            book_spread_usd:       None,
+        }
+    }
+
+    /// Record a new book snapshot and update the imbalance tracker.
+    ///
+    /// Called from the pipeline book stage on every [`BookSnapshot`].
+    /// Cheap: only updates the per-exchange imbalance entry; the full feature
+    /// vector is recomputed on the next `update_from_fused` call.
+    pub fn update_book(&mut self, snap: &crate::types::BookSnapshot) {
+        if let Some(imb) = snap.imbalance(5) {
+            self.book_imbalance.update(snap.exchange, imb, snap.ts_micros);
         }
     }
 
@@ -417,6 +497,11 @@ impl FeatureState {
             realised_vol_30s:      self.realised_30.value(),
             // Use the fuser's pre-computed cross-exchange spread directly
             inter_exchange_spread: fused.cross_exchange_spread,
+            // Book features populated if any book feed has sent a fresh snapshot
+            book_imbalance_top5:   self.book_imbalance.fused_imbalance(ts),
+            book_imbalance_full:   self.book_imbalance.fused_imbalance(ts),
+            book_weighted_mid:     None,
+            book_spread_usd:       None,
         }
     }
 }
@@ -464,3 +549,4 @@ mod tests {
         assert!((s.spread() - 10.0).abs() < 1e-6);
     }
 }
+
