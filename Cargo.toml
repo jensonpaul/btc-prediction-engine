@@ -1,0 +1,81 @@
+[package]
+name        = "btc_prediction_engine"
+version     = "0.2.0"
+edition     = "2021"
+description = "Continuous, lock-free BTC/USD prediction engine — multi-exchange, multi-scale, fully async"
+license     = "MIT"
+readme      = "README.md"
+repository  = "https://github.com/yourorg/btc_prediction_engine"
+keywords    = ["bitcoin", "prediction", "trading", "websocket", "finance"]
+categories  = ["finance", "asynchronous", "network-programming"]
+
+[lib]
+name       = "btc_prediction_engine"
+crate-type = ["lib"]
+
+# ─── Feature flags ────────────────────────────────────────────────────────────
+[features]
+default = ["feeds-binance", "feeds-coinbase", "feeds-kraken", "feeds-bitstamp"]
+
+feeds-binance   = []
+feeds-coinbase  = []
+feeds-kraken    = []
+feeds-bitstamp  = []
+
+# Expose Prometheus /metrics endpoint (requires tokio HTTP listener in binary)
+metrics         = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+
+# Enable tracing instrumentation
+tracing         = ["dep:tracing"]
+
+# State snapshot persistence (bincode + zstd)
+persistence     = ["dep:bincode", "dep:zstd"]
+
+# ─── Async runtime ───────────────────────────────────────────────────────────
+[dependencies]
+tokio             = { version = "1",    features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util      = "0.3"
+
+# Serialisation
+serde             = { version = "1",    features = ["derive"] }
+serde_json        = "1"
+
+# Time
+chrono            = { version = "0.4",  features = ["serde"] }
+
+# Error handling
+thiserror         = "1"
+anyhow            = "1"
+
+# Concurrency — lock-free primitives
+arc-swap          = "1"             # lock-free ArcSwap for hot-path snapshot reads
+crossbeam-channel = "0.5"          # bounded SPSC for feature → model pipeline
+parking_lot       = "0.12"         # only used in cold-path stores
+
+# Async trait
+async-trait       = "0.1"
+
+# URL parsing
+url               = "2"
+
+# JWT for Coinbase Advanced Trade auth
+jsonwebtoken      = "9"
+
+# HTTP client (REST fallback + Coinbase JWT refresh)
+reqwest           = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+
+# Optional: Prometheus metrics
+metrics                      = { version = "0.23", optional = true }
+metrics-exporter-prometheus  = { version = "0.15", optional = true }
+
+# Optional: tracing
+tracing           = { version = "0.1", optional = true }
+
+# Optional: persistence
+bincode           = { version = "1",   optional = true }
+zstd              = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["full", "test-util"] }
+approx   = "0.5"
