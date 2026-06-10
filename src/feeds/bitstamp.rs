@@ -152,8 +152,8 @@ pub async fn run(config: FeedConfig, tx: mpsc::Sender<Tick>) -> EngineResult<()>
 
     loop {
         log_info(Exchange::Bitstamp, &format!("connecting → {WS_URL}"));
-        let url = url::Url::parse(WS_URL).expect("static");
-        match connect_async(url).await {
+        //let url = url::Url::parse(WS_URL).expect("static");
+        match connect_async(WS_URL).await {
             Ok((mut ws, _)) => {
                 attempt = 0;
                 log_info(Exchange::Bitstamp, &format!("connected; subscribing {channel}"));

@@ -257,8 +257,8 @@ impl Pipeline {
         // ── Stage 3: model inference (parallel) ─────────────────────────────
         let model_handle = {
             let steps        = config.forecast_steps.clone();
-            let ext_trend    = config.ext_trend;
-            let ext_forecast = config.ext_forecast;
+            let ext_trend    = config.ext_trend.map(Arc::from);
+            let ext_forecast = config.ext_forecast.map(Arc::from);
             let health_clone = health.clone();
             tokio::spawn(async move {
                 stage_models(feat_rx, snap_tx, steps, ext_trend, ext_forecast, health_clone).await;
