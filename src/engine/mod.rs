@@ -17,10 +17,10 @@
 //! async fn main() {
 //!     let (engine, _handles) = PredictionEngine::start(EngineConfig::default()).await;
 //!
-//!     // Attach feeds — all run in parallel, non-blocking
-//!     engine.add_feed(FeedConfig::public(Exchange::Binance,  Symbol::BtcUsd)).await;
-//!     engine.add_feed(FeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd)).await;
-//!     engine.add_feed(FeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd)).await;
+//!     // Attach feeds — synchronous, each spawns a background task
+//!     engine.add_feed(FeedConfig::public(Exchange::Binance,  Symbol::BtcUsd));
+//!     engine.add_feed(FeedConfig::public(Exchange::Kraken,   Symbol::BtcUsd));
+//!     engine.add_feed(FeedConfig::public(Exchange::Bitstamp, Symbol::BtcUsd));
 //!
 //!     // Subscribe to push updates
 //!     let mut rx = engine.subscribe();

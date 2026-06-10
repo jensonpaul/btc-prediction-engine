@@ -48,8 +48,8 @@
 //!
 //! ## Recommended upgrade path
 //!
-//! 1. Collect `(feature_array, label)` pairs from a replay run (see
-//!    `EngineConfig::replay_mode`).
+//! 1. Collect `(feature_array, label)` pairs from a historical replay
+//!    by injecting ticks via [`crate::engine::PredictionEngine::inject_tick`].
 //! 2. Label: `return_5min > +0.1%` → Bullish(2), `< -0.1%` → Bearish(0), else Sideways(1).
 //! 3. Walk-forward train/validate (never random split).
 //! 4. Export to ONNX (`torch.onnx.export`) or XGBoost JSON.

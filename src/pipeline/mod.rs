@@ -351,10 +351,6 @@ async fn stage_models(
     health:          FeedHealthTracker,
 ) {
     let mut ms_model = MultiScaleTrendModel::new();
-    // Wrap in Arc for sharing across concurrent closures if needed in future
-    // Wrap in Arc so they can be shared across async closures (Arc<dyn Trait> is Clone)
-    let ext_trend:    Option<Arc<dyn TrendModelExt>>    = ext_trend.map(|b| Arc::from(b));
-    let ext_forecast: Option<Arc<dyn ForecastModelExt>> = ext_forecast.map(|b| Arc::from(b));
 
     while let Some(fv) = rx.recv().await {
         // ── EMA multi-scale signals (synchronous, O(1) each) ─────────────────
