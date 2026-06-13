@@ -251,6 +251,25 @@ pub struct EngineMetrics {
 
 // ─── Prediction snapshot ──────────────────────────────────────────────────────
 
+/// The four per-scale signals and fused result from the built-in heuristic
+/// classifier (EMA crossover + RSI/OFI/momentum composite).
+///
+/// Always populated regardless of whether an external ONNX model is loaded.
+/// When [`PredictionSnapshot::onnx`] is `None` (no `ext_trend` configured),
+/// `micro`/`short`/`medium`/`broad` on the snapshot are identical to the
+/// heuristic signals here.  When an ONNX model *is* active they differ —
+/// the top-level fields carry the ONNX signals, and this struct preserves
+/// the heuristic baseline for side-by-side comparison in the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeuristicSnapshot {
+    pub micro:            TrendSignal,
+    pub short:            TrendSignal,
+    pub medium:           TrendSignal,
+    pub broad:            TrendSignal,
+    pub fused_direction:  TrendDirection,
+    pub fused_confidence: f64,
+}
+
 /// Complete prediction state at a single µs tick.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictionSnapshot {
@@ -266,6 +285,18 @@ pub struct PredictionSnapshot {
     pub fused_direction:  TrendDirection,
     pub fused_confidence: f64,
     pub metrics:          EngineMetrics,
+    /// Heuristic baseline signals — always populated.
+    ///
+    /// When `ext_trend` is `None` the heuristic *is* the primary prediction,
+    /// so these values mirror `micro`/`short`/`medium`/`broad` above.
+    /// When an ONNX (or other external) model is active, the top-level fields
+    /// carry the model's signals and this field preserves the heuristic for
+    /// comparison.
+    pub heuristic:        HeuristicSnapshot,
+    /// `true` when the top-level signals come from an external model
+    /// (`ext_trend` was `Some`).  `false` means heuristic and primary signals
+    /// are identical.
+    pub model_active:     bool,
 }
 
 // ─── Window projection ───────────────────────────────────────────────────────

@@ -50,8 +50,8 @@ use crate::models::{
 };
 use crate::price_fusion::{run_fuser, FusedTick, FusionConfig};
 use crate::types::{
-    BookSnapshot, EngineMetrics, Exchange, FeedHealth, PredictionSnapshot, ShortTermForecast,
-    TimeScale, Tick, TickStore, TrendDirection, TrendSignal, PredictionStore,
+    BookSnapshot, EngineMetrics, Exchange, FeedHealth, HeuristicSnapshot, PredictionSnapshot,
+    ShortTermForecast, TimeScale, Tick, TickStore, TrendDirection, TrendSignal, PredictionStore,
 };
 
 // ─── Channel capacities ───────────────────────────────────────────────────────
@@ -387,19 +387,43 @@ async fn stage_models(
         // ── EMA multi-scale signals (synchronous, O(1) each) ─────────────────
         let ms_signals = ms_model.update(&fv);
 
-        // ── Direction signals — run per-scale in parallel ─────────────────────
-        let signals: [TrendSignal; 4] = if let Some(ext) = &ext_trend {
+        // ── Heuristic signals — always computed ───────────────────────────────
+        // The heuristic is both the built-in fallback and the comparison
+        // baseline when an ONNX model is active.
+        let heuristic_snap = {
+            let heuristic_short = HeuristicDirectionClassifier::predict(&fv, TimeScale::Short);
+            let blended         = blend(&ms_signals[1], &heuristic_short, 0.6);
+            let sigs = [ms_signals[0].clone(), blended, ms_signals[2].clone(), ms_signals[3].clone()];
+            let (fused_dir, fused_conf) = SignalFuser::fuse(&sigs);
+            HeuristicSnapshot {
+                micro:            sigs[0].clone(),
+                short:            sigs[1].clone(),
+                medium:           sigs[2].clone(),
+                broad:            sigs[3].clone(),
+                fused_direction:  fused_dir,
+                fused_confidence: fused_conf,
+            }
+        };
+
+        // ── Primary signals — ONNX model if present, heuristic otherwise ──────
+        let (model_active, signals) = if let Some(ext) = &ext_trend {
             let (s0, s1, s2, s3) = tokio::join!(
                 async { ext.predict(&fv, TimeScale::Micro) },
                 async { ext.predict(&fv, TimeScale::Short) },
                 async { ext.predict(&fv, TimeScale::Medium) },
                 async { ext.predict(&fv, TimeScale::Broad) },
             );
-            [s0, s1, s2, s3]
+            (true, [s0, s1, s2, s3])
         } else {
-            let heuristic_short = HeuristicDirectionClassifier::predict(&fv, TimeScale::Short);
-            let blended         = blend(&ms_signals[1], &heuristic_short, 0.6);
-            [ms_signals[0].clone(), blended, ms_signals[2].clone(), ms_signals[3].clone()]
+            // When no external model is loaded the primary signals ARE the
+            // heuristic signals.  Clone from the already-built snapshot to
+            // avoid re-computing.
+            (false, [
+                heuristic_snap.micro.clone(),
+                heuristic_snap.short.clone(),
+                heuristic_snap.medium.clone(),
+                heuristic_snap.broad.clone(),
+            ])
         };
 
         // ── Fuse ─────────────────────────────────────────────────────────────
@@ -451,6 +475,8 @@ async fn stage_models(
             fused_direction,
             fused_confidence,
             metrics:          engine_metrics,
+            heuristic:        heuristic_snap,
+            model_active,
         };
 
         if tx.try_send(snap).is_err() {

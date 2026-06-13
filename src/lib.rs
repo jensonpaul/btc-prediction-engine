@@ -153,6 +153,7 @@ pub mod prelude {
         Exchange, Symbol,
         FeedHealth,
         Ohlcv,
+        HeuristicSnapshot,
         PredictionSnapshot,
         ShortTermForecast,
         TimeScale,
