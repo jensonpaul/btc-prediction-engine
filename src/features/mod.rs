@@ -153,109 +153,242 @@ impl TickVelocity {
 
 // ─── Order flow imbalance ────────────────────────────────────────────────────
 
-pub struct OrderFlowImbalance { window_micros: i64, entries: VecDeque<(i64, f64, Option<TradeSide>)> }
+/// Rolling order-flow imbalance with O(1) `value()`.
+///
+/// `buy_sum` and `sell_sum` are kept in sync with the window on every
+/// insertion and eviction, so `value()` needs no scan.
+pub struct OrderFlowImbalance {
+    window_micros: i64,
+    /// (ts_micros, buy_qty, sell_qty)
+    entries:  VecDeque<(i64, f64, f64)>,
+    buy_sum:  f64,
+    sell_sum: f64,
+}
 
 impl OrderFlowImbalance {
-    pub fn new(window_secs: i64) -> Self { Self { window_micros: window_secs * 1_000_000, entries: VecDeque::new() } }
-    pub fn update(&mut self, tick: &Tick) {
-        self.entries.push_back((tick.ts_micros, tick.quantity, tick.side));
-        let cutoff = tick.ts_micros - self.window_micros;
-        while self.entries.front().map_or(false, |e| e.0 < cutoff) { self.entries.pop_front(); }
+    pub fn new(window_secs: i64) -> Self {
+        Self {
+            window_micros: window_secs * 1_000_000,
+            entries:  VecDeque::new(),
+            buy_sum:  0.0,
+            sell_sum: 0.0,
+        }
     }
+
+    #[inline]
+    fn evict_stale(&mut self, cutoff: i64) {
+        while self.entries.front().map_or(false, |e| e.0 < cutoff) {
+            let (_, bq, sq) = self.entries.pop_front().unwrap();
+            self.buy_sum  -= bq;
+            self.sell_sum -= sq;
+        }
+    }
+
+    pub fn update(&mut self, tick: &Tick) {
+        let (bq, sq) = match tick.side {
+            Some(TradeSide::Buy)  => (tick.quantity, 0.0),
+            Some(TradeSide::Sell) => (0.0, tick.quantity),
+            None                  => (0.0, 0.0),
+        };
+        self.buy_sum  += bq;
+        self.sell_sum += sq;
+        self.entries.push_back((tick.ts_micros, bq, sq));
+        self.evict_stale(tick.ts_micros - self.window_micros);
+    }
+
     /// Update from pre-aggregated buy/sell volumes (used by the fusion pipeline).
     pub fn update_fused(&mut self, ts: i64, buy_vol: f64, sell_vol: f64) {
-        // Represent as two synthetic entries: one buy, one sell
-        if buy_vol > 0.0  { self.entries.push_back((ts, buy_vol,  Some(TradeSide::Buy)));  }
-        if sell_vol > 0.0 { self.entries.push_back((ts, sell_vol, Some(TradeSide::Sell))); }
-        let cutoff = ts - self.window_micros;
-        while self.entries.front().map_or(false, |e| e.0 < cutoff) { self.entries.pop_front(); }
+        self.buy_sum  += buy_vol;
+        self.sell_sum += sell_vol;
+        self.entries.push_back((ts, buy_vol, sell_vol));
+        self.evict_stale(ts - self.window_micros);
     }
+
+    /// O(1) — reads running sums directly.
+    #[inline]
     pub fn value(&self) -> f64 {
-        let (mut buy, mut sell, mut total) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for (_, qty, side) in &self.entries {
-            total += qty;
-            match side { Some(TradeSide::Buy) => buy += qty, Some(TradeSide::Sell) => sell += qty, None => {} }
-        }
-        if total == 0.0 { 0.0 } else { (buy - sell) / total }
+        let total = self.buy_sum + self.sell_sum;
+        if total == 0.0 { 0.0 } else { (self.buy_sum - self.sell_sum) / total }
     }
 }
 
 // ─── Return autocorrelation (lag-1) ─────────────────────────────────────────
 
-/// Incremental lag-1 autocorrelation of log-returns.
+/// Incremental lag-1 Pearson autocorrelation of log-returns — O(1) per tick.
+///
+/// Maintains five running sums over the pair series (x[i] = r[i], y[i] = r[i+1]):
+///
+/// ```text
+///   sum_x  = Σ r[i]       (i = 0 .. n-2)
+///   sum_y  = Σ r[i+1]     (i = 0 .. n-2)
+///   sum_x2 = Σ r[i]²
+///   sum_y2 = Σ r[i+1]²
+///   sum_xy = Σ r[i]·r[i+1]
+/// ```
+///
+/// When the oldest return `r_old` leaves the window the pair `(r_old, r_next)`
+/// is removed from {sum_x, sum_xy, sum_x2}, and the pair `(r_prev_new_head,
+/// r_new_head)` is added to {sum_y, sum_xy, sum_y2} as the new tail pair.
+/// Concretely, the window of *pairs* shrinks by one at the front (x-side) and
+/// the new head of the returns window becomes the x of the only surviving pair
+/// that was previously an interior pair — which is already accounted for.
+///
+/// The simpler bookkeeping: think of the pair window as the `returns` deque
+/// minus its last element (x-series) and minus its first element (y-series).
+/// On push we add one pair; on pop we remove one pair.
 pub struct ReturnAutocorr {
     window:  usize,
     returns: VecDeque<f64>,
     prev:    Option<f64>,
+    // Running sums over the pair series of length (n-1)
+    sum_x:   f64,
+    sum_y:   f64,
+    sum_x2:  f64,
+    sum_y2:  f64,
+    sum_xy:  f64,
 }
 
 impl ReturnAutocorr {
-    pub fn new(window: usize) -> Self { Self { window, returns: VecDeque::with_capacity(window + 1), prev: None } }
+    pub fn new(window: usize) -> Self {
+        Self {
+            window,
+            returns: VecDeque::with_capacity(window + 1),
+            prev:    None,
+            sum_x:   0.0,
+            sum_y:   0.0,
+            sum_x2:  0.0,
+            sum_y2:  0.0,
+            sum_xy:  0.0,
+        }
+    }
+
     pub fn update(&mut self, price: f64) {
         if let Some(p) = self.prev {
             if p > 0.0 {
                 let r = (price / p).ln();
+
+                // The new return pairs with the current tail as (tail, r).
+                if let Some(&tail) = self.returns.back() {
+                    self.sum_x  += tail;
+                    self.sum_y  += r;
+                    self.sum_x2 += tail * tail;
+                    self.sum_y2 += r * r;
+                    self.sum_xy += tail * r;
+                }
+
                 self.returns.push_back(r);
-                if self.returns.len() > self.window { self.returns.pop_front(); }
+
+                // Evict the oldest return when the window is full.
+                if self.returns.len() > self.window {
+                    let evicted = self.returns.pop_front().unwrap();
+                    // The pair (evicted, next_head) leaves the x-side.
+                    if let Some(&next_head) = self.returns.front() {
+                        self.sum_x  -= evicted;
+                        self.sum_y  -= next_head;
+                        self.sum_x2 -= evicted * evicted;
+                        self.sum_y2 -= next_head * next_head;
+                        self.sum_xy -= evicted * next_head;
+                    }
+                }
             }
         }
         self.prev = Some(price);
     }
-    /// Pearson correlation between r[t] and r[t-1].
+
+    /// Pearson correlation between r[t] and r[t-1] — O(1).
+    #[inline]
     pub fn value(&self) -> Option<f64> {
         let n = self.returns.len();
         if n < 4 { return None; }
-        let r: Vec<f64> = self.returns.iter().copied().collect();
-        let (x, y): (Vec<f64>, Vec<f64>) = (r[..n-1].to_vec(), r[1..].to_vec());
-        let mx = mean(&x);
-        let my = mean(&y);
-        let cov: f64 = x.iter().zip(y.iter()).map(|(a, b)| (a - mx) * (b - my)).sum::<f64>() / (n - 1) as f64;
-        let sx = std_dev(&x, mx);
-        let sy = std_dev(&y, my);
-        if sx * sy == 0.0 { None } else { Some((cov / (sx * sy)).clamp(-1.0, 1.0)) }
+        let m = (n - 1) as f64; // number of pairs
+
+        // population Pearson over the pair series
+        let var_x = self.sum_x2 - self.sum_x * self.sum_x / m;
+        let var_y = self.sum_y2 - self.sum_y * self.sum_y / m;
+        let cov   = self.sum_xy - self.sum_x * self.sum_y / m;
+
+        let denom = (var_x * var_y).sqrt();
+        if denom == 0.0 { None } else { Some((cov / denom).clamp(-1.0, 1.0)) }
     }
 }
 
-fn mean(v: &[f64]) -> f64 { v.iter().sum::<f64>() / v.len() as f64 }
-fn std_dev(v: &[f64], m: f64) -> f64 { (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt() }
-
 // ─── Realised volatility ─────────────────────────────────────────────────────
 
-/// Rolling realised volatility (std of log-returns over a window).
-pub struct RealisedVol { window_secs: i64, entries: VecDeque<(i64, f64)>, prev: Option<(i64, f64)> }
+/// Rolling realised volatility (std of log-returns over a window) — O(1) per tick.
+///
+/// Maintains `sum` (Σ r) and `sum_sq` (Σ r²) so that `value()` computes the
+/// sample standard deviation without any allocation or window scan:
+///
+/// ```text
+/// variance = (sum_sq − sum² / n) / (n − 1)
+/// ```
+pub struct RealisedVol {
+    window_micros: i64,
+    entries: VecDeque<(i64, f64)>,
+    prev:    Option<(i64, f64)>,
+    sum:     f64,
+    sum_sq:  f64,
+}
 
 impl RealisedVol {
     pub fn new(window_secs: i64) -> Self {
-        Self { window_secs, entries: VecDeque::new(), prev: None }
+        Self {
+            window_micros: window_secs * 1_000_000,
+            entries: VecDeque::new(),
+            prev:    None,
+            sum:     0.0,
+            sum_sq:  0.0,
+        }
     }
+
+    #[inline]
+    fn push_return(&mut self, ts: i64, r: f64) {
+        self.sum    += r;
+        self.sum_sq += r * r;
+        self.entries.push_back((ts, r));
+    }
+
+    #[inline]
+    fn evict_stale(&mut self, cutoff: i64) {
+        while self.entries.front().map_or(false, |e| e.0 < cutoff) {
+            let (_, r) = self.entries.pop_front().unwrap();
+            self.sum    -= r;
+            self.sum_sq -= r * r;
+        }
+    }
+
     pub fn update(&mut self, tick: &Tick) {
         if let Some((_, pp)) = self.prev {
             if pp > 0.0 {
                 let r = (tick.price / pp).ln();
-                self.entries.push_back((tick.ts_micros, r));
-                let cutoff = tick.ts_micros - self.window_secs * 1_000_000;
-                while self.entries.front().map_or(false, |e| e.0 < cutoff) { self.entries.pop_front(); }
+                self.push_return(tick.ts_micros, r);
+                self.evict_stale(tick.ts_micros - self.window_micros);
             }
         }
         self.prev = Some((tick.ts_micros, tick.price));
     }
+
     /// Update from a fused canonical price (used by the fusion pipeline).
     pub fn update_fused(&mut self, ts: i64, price: f64) {
         if let Some((_, pp)) = self.prev {
             if pp > 0.0 {
                 let r = (price / pp).ln();
-                self.entries.push_back((ts, r));
-                let cutoff = ts - self.window_secs * 1_000_000;
-                while self.entries.front().map_or(false, |e| e.0 < cutoff) { self.entries.pop_front(); }
+                self.push_return(ts, r);
+                self.evict_stale(ts - self.window_micros);
             }
         }
         self.prev = Some((ts, price));
     }
+
+    /// Sample standard deviation of log-returns — O(1).
+    #[inline]
     pub fn value(&self) -> Option<f64> {
-        let v: Vec<f64> = self.entries.iter().map(|e| e.1).collect();
-        if v.len() < 3 { return None; }
-        let m = mean(&v);
-        Some(std_dev(&v, m))
+        let n = self.entries.len();
+        if n < 3 { return None; }
+        let nf = n as f64;
+        let variance = (self.sum_sq - self.sum * self.sum / nf) / (nf - 1.0);
+        // Guard against tiny negative values from floating-point cancellation.
+        Some(variance.max(0.0).sqrt())
     }
 }
 
@@ -295,14 +428,17 @@ impl BookImbalanceTracker {
     /// Volume-averaged imbalance across all exchanges with a fresh snapshot.
     ///
     /// Returns `None` if no exchange has a fresh snapshot.
+    ///
+    /// Accumulates into stack variables — no heap allocation.
     pub fn fused_imbalance(&self, now_micros: i64) -> Option<f64> {
-        let fresh: Vec<f64> = self.last.values()
-            .filter_map(|&(imb, ts)| {
-                if now_micros - ts <= BOOK_STALE_MICROS { Some(imb) } else { None }
-            })
-            .collect();
-        if fresh.is_empty() { return None; }
-        Some(fresh.iter().sum::<f64>() / fresh.len() as f64)
+        let (mut total, mut count) = (0.0_f64, 0u32);
+        for &(imb, ts) in self.last.values() {
+            if now_micros - ts <= BOOK_STALE_MICROS {
+                total += imb;
+                count += 1;
+            }
+        }
+        if count == 0 { None } else { Some(total / count as f64) }
     }
 }
 
@@ -549,4 +685,3 @@ mod tests {
         assert!((s.spread() - 10.0).abs() < 1e-6);
     }
 }
-
