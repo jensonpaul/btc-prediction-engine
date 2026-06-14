@@ -16,55 +16,38 @@
 //!
 //! ## Training feature vector
 //!
-//! The 17 features available in [`crate::features::FeatureVector`]. The first
-//! 13 are always populated; book features (14–17) are `None` when no book feed
-//! is connected — substitute sensible defaults (shown in `feature_array` below).
+//! The 28 features in [`crate::features::FeatureVector`], all time-horizon
+//! aligned and scale-normalised.  See `btc-model-trainer/src/main.rs`
+//! (`FEATURE_NAMES` / `feature_array`) for the exact ordering written to disk.
 //!
 //! ```text
-//!  1  rsi_14               – Wilder RSI, 14-tick period
-//!  2  vwap_deviation        – (price − session VWAP) / VWAP
-//!  3  momentum_micro        – (p_now − p_30ago) / p_30ago
-//!  4  momentum_short        – (p_now − p_300ago) / p_300ago
-//!  5  ewma_vol_tick         – per-tick EWMA σ
-//!  6  tick_velocity         – 30-s rolling tick rate (ticks/s)
-//!  7  ofi_30s               – order flow imbalance, 30 s  ∈ [−1, 1]
-//!  8  ofi_300s              – order flow imbalance, 300 s ∈ [−1, 1]
-//!  9  autocorr_lag1         – lag-1 return autocorrelation ∈ [−1, 1]
-//! 10  realised_vol_30s      – realised vol, 30-s window
-//! 11  inter_exchange_spread – max − min last price across exchanges (USD)
-//! 12  price                 – current BTC/USD (normalised in feature_array)
-//! 13  ewma_variance         – EWMA price variance
-//! 14  book_imbalance_top5   – top-5 bid/ask volume imbalance ∈ [−1, 1]
-//! 15  book_imbalance_full   – full-depth bid/ask imbalance ∈ [−1, 1]
-//! 16  book_weighted_mid     – volume-weighted mid-price (USD)
-//! 17  book_spread_usd       – best bid–ask spread (USD)
-//! ```
-//!
-//! ## Export helper (call from training code)
-//!
-//! ```rust,ignore
-//! pub fn feature_array(f: &FeatureVector) -> [f64; 17] {
-//!     [
-//!         f.rsi_14.unwrap_or(50.0) / 100.0,
-//!         f.vwap_deviation.unwrap_or(0.0),
-//!         f.momentum_micro.unwrap_or(0.0),
-//!         f.momentum_short.unwrap_or(0.0),
-//!         f.ewma_vol_tick.unwrap_or(0.001),
-//!         f.tick_velocity / 20.0,
-//!         f.ofi_30s,
-//!         f.ofi_300s,
-//!         f.autocorr_lag1.unwrap_or(0.0),
-//!         f.realised_vol_30s.unwrap_or(0.001),
-//!         f.inter_exchange_spread / 100.0,
-//!         (f.price - 30_000.0) / 70_000.0,   // normalised BTC price
-//!         f.ewma_variance,
-//!         // Book features: default to 0.0 (neutral) when no book feed connected
-//!         f.book_imbalance_top5.unwrap_or(0.0),
-//!         f.book_imbalance_full.unwrap_or(0.0),
-//!         f.book_weighted_mid.map(|m| (m - 30_000.0) / 70_000.0).unwrap_or(0.0),
-//!         f.book_spread_usd.map(|s| s / 100.0).unwrap_or(0.0),
-//!     ]
-//! }
+//!  1  return_5s        – log-return over last 5 s
+//!  2  return_30s       – log-return over last 30 s
+//!  3  return_300s      – log-return over last 300 s
+//!  4  vol_30s          – realised vol (std of log-returns), 30 s
+//!  5  vol_300s         – realised vol, 300 s
+//!  6  vol_1800s        – realised vol, 1800 s (regime reference)
+//!  7  vol_ratio        – vol_30s / vol_1800s
+//!  8  ofi_5s           – order-flow imbalance, 5 s
+//!  9  ofi_30s          – order-flow imbalance, 30 s
+//! 10  ofi_300s         – order-flow imbalance, 300 s
+//! 11  ofi_delta_30s    – ofi_5s − ofi_30s
+//! 12  buy_ratio_30s    – buy_vol / total_vol, 30 s
+//! 13  buy_ratio_300s   – buy_vol / total_vol, 300 s
+//! 14  vwap_dev_30s     – (price − VWAP_30s) / VWAP_30s / vol_1800s
+//! 15  vwap_dev_300s    – (price − VWAP_300s) / VWAP_300s / vol_1800s
+//! 16  volume_ratio     – volume_30s / volume_300s
+//! 17  tick_velocity    – rolling tick rate, 30 s window (ticks/s / 20)
+//! 18  activity_regime  – tick_rate_30s / tick_rate_1800s
+//! 19  spread_pct       – cross-exchange (max−min) / mid
+//! 20  book_imb5        – top-5 bid/ask volume imbalance ∈ [−1, 1]
+//! 21  book_imb_full    – full-depth bid/ask imbalance ∈ [−1, 1]
+//! 22  book_spread_pct  – best bid-ask spread / mid
+//! 23  book_pressure    – micro-price deviation from mid
+//! 24  trend_strength   – abs(return_300s) / vol_1800s
+//! 25  vol_regime       – vol_300s / vol_1800s
+//! 26  zreturn_30s      – return_30s / vol_1800s
+//! 27  zreturn_300s     – return_300s / vol_1800s
 //! ```
 //!
 //! ## Recommended upgrade path
@@ -140,10 +123,10 @@ impl MultiScaleTrendModel {
         let ef = self.med_f.update(p);    let es = self.med_s.update(p);
         let bf = self.broad_f.update(p);  let bs = self.broad_s.update(p);
         [
-            Self::crossover(mf, ms, f.momentum_micro,  TimeScale::Micro,  ts),
-            Self::crossover(sf, ss, f.momentum_short,  TimeScale::Short,  ts),
-            Self::crossover(ef, es, f.momentum_short,  TimeScale::Medium, ts),
-            Self::crossover(bf, bs, None,              TimeScale::Broad,  ts),
+            Self::crossover(mf, ms, f.return_5s,   TimeScale::Micro,  ts),
+            Self::crossover(sf, ss, f.return_30s,  TimeScale::Short,  ts),
+            Self::crossover(ef, es, f.return_30s,  TimeScale::Medium, ts),
+            Self::crossover(bf, bs, f.return_300s, TimeScale::Broad,  ts),
         ]
     }
 
@@ -177,33 +160,55 @@ impl HeuristicDirectionClassifier {
     pub fn predict(f: &FeatureVector, scale: TimeScale) -> TrendSignal {
         let ts = f.ts_micros;
 
-        let rsi_score = f.rsi_14.map(|r| {
-            if r > 70.0 { -0.5 } else if r < 30.0 { 0.5 } else { (r - 50.0) / 50.0 }
-        }).unwrap_or(0.0);
-
+        // Momentum signal — use time-aligned returns matched to the scale.
+        // z-scored returns are preferred when vol_1800s is available because
+        // they normalise across price regimes; fall back to raw log-returns.
         let mom_score = match scale {
-            TimeScale::Micro | TimeScale::Short => f.momentum_micro.unwrap_or(0.0) * 100.0,
-            _ => f.momentum_short.unwrap_or(0.0) * 100.0,
-        }.clamp(-1.0, 1.0);
+            TimeScale::Micro => f.zreturn_30s
+                .or(f.return_5s)
+                .unwrap_or(0.0),
+            TimeScale::Short => f.zreturn_30s
+                .or(f.return_30s)
+                .unwrap_or(0.0),
+            _ => f.zreturn_300s
+                .or(f.return_300s)
+                .unwrap_or(0.0),
+        }.clamp(-3.0, 3.0) / 3.0; // normalise z-score to [−1, 1]
 
+        // Order-flow signal.
         let ofi_score = match scale {
-            TimeScale::Micro => f.ofi_30s,
+            TimeScale::Micro => f.ofi_5s,
+            TimeScale::Short => f.ofi_30s,
             _                => f.ofi_300s,
         };
 
-        let vwap_score = f.vwap_deviation.unwrap_or(0.0).clamp(-0.01, 0.01) * 100.0;
+        // VWAP deviation — already z-scored; clamp to ±3σ → [−1, 1].
+        let vwap_score = match scale {
+            TimeScale::Micro | TimeScale::Short =>
+                f.vwap_dev_30s.unwrap_or(0.0).clamp(-3.0, 3.0) / 3.0,
+            _ =>
+                f.vwap_dev_300s.unwrap_or(0.0).clamp(-3.0, 3.0) / 3.0,
+        };
 
-        // Autocorrelation: positive → momentum regime; negative → mean-reversion
-        let autocorr_score = f.autocorr_lag1.unwrap_or(0.0) * mom_score.signum();
+        // Book pressure: positive = bid side dominates → bullish lean.
+        let book_score = f.book_pressure.unwrap_or(0.0).clamp(-0.01, 0.01) * 100.0;
 
-        // High inter-exchange spread → uncertainty; dampen confidence
-        let spread_dampen = if f.inter_exchange_spread > 50.0 { 0.8 } else { 1.0 };
+        // Volatility expansion dampens confidence — when vol_ratio >> 1 the
+        // market is spiking and short signals are less reliable.
+        let vol_dampen = f.vol_ratio.map(|vr| {
+            // Smoothly reduce to 0.5× at vol_ratio = 3.0.
+            (1.0 - (vr - 1.0).max(0.0) / 4.0).max(0.5)
+        }).unwrap_or(1.0);
 
-        let composite = (0.25 * rsi_score
-            + 0.30 * mom_score
-            + 0.25 * ofi_score
-            + 0.10 * vwap_score
-            + 0.10 * autocorr_score) * spread_dampen;
+        // High cross-exchange spread → uncertainty, dampen further.
+        let spread_dampen = if f.spread_pct > 0.001 { 0.8 } else { 1.0 };
+
+        let composite = (0.35 * mom_score
+            + 0.30 * ofi_score
+            + 0.20 * vwap_score
+            + 0.15 * book_score)
+            * vol_dampen
+            * spread_dampen;
 
         let thr = 0.1;
         let direction = if composite > thr { TrendDirection::Bullish }
@@ -231,17 +236,26 @@ pub struct MomentumExtrapolator;
 
 impl MomentumExtrapolator {
     pub fn forecast(f: &FeatureVector, step_secs: u32, n_steps: usize) -> ShortTermForecast {
-        let drift = f.momentum_micro.unwrap_or(0.0) * f.price / 30.0; // USD/s
-        let vol_t = f.ewma_vol_tick.unwrap_or(0.001);
+        // Drift: use the 5s return as the instantaneous velocity estimate.
+        // Divide by 5 to get a per-second rate, then multiply by price for USD/s.
+        let drift = f.return_5s.unwrap_or(0.0) * f.price / 5.0; // USD/s
+
+        // Per-step volatility: use vol_30s (closest horizon to typical step sizes);
+        // fall back to vol_1800s, then a hard floor.
+        let vol_ref = f.vol_30s
+            .or(f.vol_1800s)
+            .unwrap_or(0.001);
         let ticks_per_step = (step_secs as f64 * f.tick_velocity.max(1.0)).max(1.0);
-        let vol_per_step = vol_t * ticks_per_step.sqrt() * f.price;
+        let vol_per_step = vol_ref * ticks_per_step.sqrt() * f.price;
 
         let decay = 60.0_f64;
         let deltas: Vec<f64>     = (1..=n_steps).map(|i| drift * step_secs as f64 * i as f64).collect();
         let confidence: Vec<f64> = (1..=n_steps).map(|i| {
-            let t = step_secs as f64 * i as f64;
+            let t    = step_secs as f64 * i as f64;
             let conf = (-t / decay).exp();
-            let snr  = if vol_per_step > 0.0 { (drift.abs() * step_secs as f64 / vol_per_step).min(1.0) } else { 0.5 };
+            let snr  = if vol_per_step > 0.0 {
+                (drift.abs() * step_secs as f64 / vol_per_step).min(1.0)
+            } else { 0.5 };
             (conf * snr).clamp(0.0, 1.0)
         }).collect();
 

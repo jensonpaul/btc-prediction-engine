@@ -461,7 +461,7 @@ async fn stage_models(
             dedup_rate:            0.0,
             outlier_rate:          0.0,
             connected_feeds:       health.connected_count(),
-            cross_exchange_spread: fv.inter_exchange_spread,
+            cross_exchange_spread: fv.spread_pct,
         };
 
         let snap = PredictionSnapshot {

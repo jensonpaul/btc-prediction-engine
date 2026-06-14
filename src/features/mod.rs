@@ -1,162 +1,237 @@
 //! Incremental feature engineering — all O(1) per tick.
 //!
+//! # Design principles
+//!
+//! Every feature is expressed on a **real-time horizon**, not a tick-count
+//! window.  This keeps features economically consistent across market regimes:
+//! the same 30-second momentum means the same thing whether the market is
+//! printing 5 ticks/s or 50 ticks/s.
+//!
+//! All features are **scale-normalised** where possible (percentage, z-score,
+//! or ratio), so they generalise across BTC price regimes from $20 k to $100 k+.
+//!
+//! # Feature hierarchy (time horizons)
+//!
+//! ```text
+//! 5 s   — microstructure / order-flow momentum
+//! 30 s  — short-term signal
+//! 300 s — prediction horizon (matches label window)
+//! 1800 s — regime / normalisation reference
+//! ```
+//!
 //! # Feature inventory
 //!
-//! | Feature | Range | Description |
-//! |---|---|---|
-//! | `rsi_14` | [0, 100] | Wilder RSI, 14-tick period |
-//! | `vwap_deviation` | fraction | (price − session VWAP) / VWAP |
-//! | `momentum_micro` | fraction | (p_now − p_30ago) / p_30ago |
-//! | `momentum_short` | fraction | (p_now − p_300ago) / p_300ago |
-//! | `ewma_vol_tick` | fraction | Per-tick EWMA σ |
-//! | `tick_velocity` | ticks/s | 30-s rolling rate |
-//! | `ofi_30s` | [−1, 1] | Order flow imbalance, 30 s |
-//! | `ofi_300s` | [−1, 1] | Order flow imbalance, 300 s |
-//! | `autocorr_lag1` | [−1, 1] | Lag-1 return autocorrelation |
-//! | `realised_vol_30s` | fraction | Realised vol, 30-s window |
-//! | `inter_exchange_spread` | USD | max − min last price per exchange |
-//! | `price` | USD | Current BTC/USD price |
-//! | `book_imbalance_top5` | [−1, 1] | Top-5 bid/ask volume imbalance (book feeds) |
-//! | `book_imbalance_full` | [−1, 1] | Full-depth bid/ask volume imbalance (book feeds) |
-//! | `book_weighted_mid` | USD | Volume-weighted mid-price (book feeds) |
-//! | `book_spread_usd` | USD | Best bid–ask spread (book feeds) |
+//! | Feature              | Range        | Description                               |
+//! |----------------------|--------------|-------------------------------------------|
+//! | `return_5s`          | fraction     | Log-return over last 5 s                  |
+//! | `return_30s`         | fraction     | Log-return over last 30 s                 |
+//! | `return_300s`        | fraction     | Log-return over last 300 s                |
+//! | `vol_30s`            | fraction     | Realised vol (std of log-returns), 30 s   |
+//! | `vol_300s`           | fraction     | Realised vol, 300 s                       |
+//! | `vol_1800s`          | fraction     | Realised vol, 1800 s (regime reference)   |
+//! | `vol_ratio`          | ratio        | vol_30s / vol_1800s — expansion detector  |
+//! | `ofi_5s`             | [−1, 1]      | Order-flow imbalance, 5 s                 |
+//! | `ofi_30s`            | [−1, 1]      | Order-flow imbalance, 30 s                |
+//! | `ofi_300s`           | [−1, 1]      | Order-flow imbalance, 300 s               |
+//! | `ofi_delta_30s`      | [−1, 1]      | ofi_5s − ofi_30s (rate-of-change proxy)   |
+//! | `buy_ratio_30s`      | [0, 1]       | buy_vol / total_vol over 30 s             |
+//! | `buy_ratio_300s`     | [0, 1]       | buy_vol / total_vol over 300 s            |
+//! | `vwap_dev_30s`       | fraction     | (price − VWAP_30s) / vol_1800s (z-score) |
+//! | `vwap_dev_300s`      | fraction     | (price − VWAP_300s) / vol_1800s           |
+//! | `volume_ratio`       | ratio        | volume_30s / volume_300s                  |
+//! | `tick_velocity`      | ticks/s      | Rolling tick rate, 30 s window            |
+//! | `spread_pct`         | fraction     | Cross-exchange (max−min)/mid              |
+//! | `book_imbalance_5`   | [−1, 1]      | Top-5 bid/ask volume imbalance            |
+//! | `book_imbalance_full`| [−1, 1]      | Full-depth bid/ask volume imbalance       |
+//! | `book_spread_pct`    | fraction     | Best bid-ask spread / mid                 |
+//! | `book_pressure`      | [−1, 1]      | Micro-price deviation from mid            |
+//! | `trend_strength`     | ≥ 0          | abs(return_1800s) / vol_1800s             |
+//! | `vol_regime`         | ratio        | vol_300s / vol_1800s                      |
+//! | `activity_regime`    | ratio        | tick_rate_30s / tick_rate_1800s           |
+//! | `zreturn_30s`        | z-score      | return_30s / vol_1800s                    |
+//! | `zreturn_300s`       | z-score      | return_300s / vol_1800s                   |
 
 use std::collections::{HashMap, VecDeque};
 use crate::types::{Exchange, Tick, TradeSide};
 use crate::price_fusion::FusedTick;
 
-// ─── Incremental RSI (Wilder) ─────────────────────────────────────────────────
+// ─── Time-windowed log-return tracker ────────────────────────────────────────
 
-pub struct IncrementalRsi {
-    period:      usize,
-    avg_gain:    f64,
-    avg_loss:    f64,
-    prev_price:  Option<f64>,
-    seeded:      bool,
-    seed_gains:  Vec<f64>,
-    seed_losses: Vec<f64>,
-}
-
-impl IncrementalRsi {
-    pub fn new(period: usize) -> Self {
-        assert!(period >= 2);
-        Self { period, avg_gain: 0.0, avg_loss: 0.0, prev_price: None,
-               seeded: false, seed_gains: Vec::with_capacity(period),
-               seed_losses: Vec::with_capacity(period) }
-    }
-
-    pub fn update(&mut self, price: f64) -> Option<f64> {
-        if let Some(prev) = self.prev_price {
-            let delta = price - prev;
-            let gain  = delta.max(0.0);
-            let loss  = (-delta).max(0.0);
-            if !self.seeded {
-                self.seed_gains.push(gain);
-                self.seed_losses.push(loss);
-                if self.seed_gains.len() == self.period {
-                    self.avg_gain = self.seed_gains.iter().sum::<f64>() / self.period as f64;
-                    self.avg_loss = self.seed_losses.iter().sum::<f64>() / self.period as f64;
-                    self.seeded = true;
-                }
-            } else {
-                let a = 1.0 / self.period as f64;
-                self.avg_gain = self.avg_gain * (1.0 - a) + gain * a;
-                self.avg_loss = self.avg_loss * (1.0 - a) + loss * a;
-            }
-        }
-        self.prev_price = Some(price);
-        self.value()
-    }
-
-    pub fn value(&self) -> Option<f64> {
-        if !self.seeded { return None; }
-        if self.avg_loss == 0.0 { return Some(100.0); }
-        Some(100.0 - 100.0 / (1.0 + self.avg_gain / self.avg_loss))
-    }
-}
-
-// ─── Session VWAP ────────────────────────────────────────────────────────────
-
-pub struct SessionVwap { pv: f64, vol: f64 }
-
-impl SessionVwap {
-    pub fn new() -> Self { Self { pv: 0.0, vol: 0.0 } }
-    pub fn update(&mut self, tick: &Tick) { self.pv += tick.price * tick.quantity; self.vol += tick.quantity; }
-    /// Update from a pre-fused price + volume (used by the fusion pipeline).
-    pub fn update_fused(&mut self, price: f64, volume: f64) { self.pv += price * volume; self.vol += volume; }
-    pub fn value(&self) -> Option<f64> { if self.vol > 0.0 { Some(self.pv / self.vol) } else { None } }
-    pub fn deviation(&self, price: f64) -> Option<f64> {
-        self.value().map(|v| if v != 0.0 { (price - v) / v } else { 0.0 })
-    }
-}
-
-// ─── EWMA Volatility ─────────────────────────────────────────────────────────
-
-/// RiskMetrics EWMA variance: σ²_t = λ·σ²_{t-1} + (1−λ)·r²_t
-pub struct EwmaVolatility { lambda: f64, pub variance: f64, prev: Option<f64>, seeded: bool }
-
-impl EwmaVolatility {
-    pub fn new(lambda: f64) -> Self { Self { lambda, variance: 0.0, prev: None, seeded: false } }
-    pub fn default_lambda() -> Self { Self::new(0.94) }
-
-    pub fn update(&mut self, price: f64) {
-        if let Some(p) = self.prev {
-            if p > 0.0 {
-                let r2 = (price / p).ln().powi(2);
-                self.variance = if self.seeded {
-                    self.lambda * self.variance + (1.0 - self.lambda) * r2
-                } else { self.seeded = true; r2 };
-            }
-        }
-        self.prev = Some(price);
-    }
-
-    pub fn tick_vol(&self) -> Option<f64> { if self.seeded { Some(self.variance.sqrt()) } else { None } }
-}
-
-// ─── Rolling momentum ────────────────────────────────────────────────────────
-
-pub struct RollingMomentum { window: usize, buf: VecDeque<f64> }
-
-impl RollingMomentum {
-    pub fn new(window: usize) -> Self { Self { window, buf: VecDeque::with_capacity(window + 1) } }
-    pub fn update(&mut self, price: f64) {
-        self.buf.push_back(price);
-        if self.buf.len() > self.window + 1 { self.buf.pop_front(); }
-    }
-    pub fn value(&self) -> Option<f64> {
-        if self.buf.len() < self.window + 1 { return None; }
-        let old = *self.buf.front().unwrap();
-        let new = *self.buf.back().unwrap();
-        if old == 0.0 { None } else { Some((new - old) / old) }
-    }
-}
-
-// ─── Tick velocity ───────────────────────────────────────────────────────────
-
-pub struct TickVelocity { window_micros: i64, buf: VecDeque<i64> }
-
-impl TickVelocity {
-    pub fn new(window_secs: i64) -> Self { Self { window_micros: window_secs * 1_000_000, buf: VecDeque::new() } }
-    pub fn update(&mut self, ts: i64) {
-        self.buf.push_back(ts);
-        let cutoff = ts - self.window_micros;
-        while self.buf.front().map_or(false, |&t| t < cutoff) { self.buf.pop_front(); }
-    }
-    pub fn rate(&self) -> f64 {
-        let n = self.buf.len();
-        if n < 2 { return 0.0; }
-        let span = (self.buf.back().unwrap() - self.buf.front().unwrap()) as f64 / 1_000_000.0;
-        if span == 0.0 { 0.0 } else { (n as f64 - 1.0) / span }
-    }
-}
-
-// ─── Order flow imbalance ────────────────────────────────────────────────────
-
-/// Rolling order-flow imbalance with O(1) `value()`.
+/// Tracks the price `horizon_micros` ago and delivers a log-return on demand.
 ///
-/// `buy_sum` and `sell_sum` are kept in sync with the window on every
-/// insertion and eviction, so `value()` needs no scan.
+/// Uses a ring buffer keyed by timestamp so the "oldest price in the window"
+/// is always the entry whose timestamp is closest to `now − horizon`.
+pub struct WindowedReturn {
+    horizon_micros: i64,
+    /// (ts_micros, log_price) — oldest first.
+    buf: VecDeque<(i64, f64)>,
+}
+
+impl WindowedReturn {
+    pub fn new(horizon_secs: i64) -> Self {
+        Self {
+            horizon_micros: horizon_secs * 1_000_000,
+            buf: VecDeque::new(),
+        }
+    }
+
+    pub fn update(&mut self, ts: i64, price: f64) {
+        if price > 0.0 {
+            self.buf.push_back((ts, price.ln()));
+        }
+        // Evict entries older than 2× horizon so we keep the one *just* outside
+        // the window as the reference price (closest to `now - horizon`).
+        let cutoff = ts - self.horizon_micros * 2;
+        while self.buf.len() > 1 {
+            let second_ts = self.buf[1].0;
+            if second_ts <= ts - self.horizon_micros {
+                // The second entry is still within or at the horizon boundary —
+                // pop the first so the second becomes the new "oldest" candidate.
+                self.buf.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Also evict anything truly ancient (> 2× horizon old).
+        while self.buf.front().map_or(false, |e| e.0 < cutoff) {
+            if self.buf.len() > 1 { self.buf.pop_front(); } else { break; }
+        }
+    }
+
+    /// Log-return from the reference price (≈ `now − horizon`) to `log_price_now`.
+    /// Returns `None` until enough history has accumulated.
+    pub fn value(&self, log_price_now: f64) -> Option<f64> {
+        let (oldest_ts, oldest_lp) = *self.buf.front()?;
+        let (newest_ts, _)         = *self.buf.back()?;
+        // Require that the oldest entry is at least 50% of the horizon old,
+        // so we don't emit near-zero returns while the window is filling up.
+        if newest_ts - oldest_ts < self.horizon_micros / 2 {
+            return None;
+        }
+        Some(log_price_now - oldest_lp)
+    }
+}
+
+// ─── Realised volatility (time-windowed, O(1)) ───────────────────────────────
+
+/// Rolling realised volatility: sample std-dev of log-returns in a time window.
+///
+/// Maintains running `sum` and `sum_sq` so `value()` is O(1).
+pub struct RealisedVol {
+    window_micros: i64,
+    /// (ts_micros, log_return)
+    entries: VecDeque<(i64, f64)>,
+    prev:    Option<(i64, f64)>,
+    sum:     f64,
+    sum_sq:  f64,
+}
+
+impl RealisedVol {
+    pub fn new(window_secs: i64) -> Self {
+        Self {
+            window_micros: window_secs * 1_000_000,
+            entries: VecDeque::new(),
+            prev:    None,
+            sum:     0.0,
+            sum_sq:  0.0,
+        }
+    }
+
+    #[inline]
+    fn push_return(&mut self, ts: i64, r: f64) {
+        self.sum    += r;
+        self.sum_sq += r * r;
+        self.entries.push_back((ts, r));
+    }
+
+    #[inline]
+    fn evict_stale(&mut self, cutoff: i64) {
+        while self.entries.front().map_or(false, |e| e.0 < cutoff) {
+            let (_, r) = self.entries.pop_front().unwrap();
+            self.sum    -= r;
+            self.sum_sq -= r * r;
+        }
+    }
+
+    pub fn update_fused(&mut self, ts: i64, price: f64) {
+        if let Some((_, pp)) = self.prev {
+            if pp > 0.0 && price > 0.0 {
+                let r = (price / pp).ln();
+                self.push_return(ts, r);
+                self.evict_stale(ts - self.window_micros);
+            }
+        }
+        self.prev = Some((ts, price));
+    }
+
+    /// Sample standard deviation of log-returns — O(1).
+    #[inline]
+    pub fn value(&self) -> Option<f64> {
+        let n = self.entries.len();
+        if n < 3 { return None; }
+        let nf = n as f64;
+        let variance = (self.sum_sq - self.sum * self.sum / nf) / (nf - 1.0);
+        Some(variance.max(0.0).sqrt())
+    }
+}
+
+// ─── Rolling VWAP (time-windowed) ────────────────────────────────────────────
+
+/// Rolling VWAP over a fixed time window.
+///
+/// Stores (ts, price×volume, volume) entries and evicts stale ones on each
+/// update, maintaining running `pv_sum` and `vol_sum` for O(1) reads.
+pub struct RollingVwap {
+    window_micros: i64,
+    /// (ts_micros, pv, vol)
+    entries: VecDeque<(i64, f64, f64)>,
+    pv_sum:  f64,
+    vol_sum: f64,
+}
+
+impl RollingVwap {
+    pub fn new(window_secs: i64) -> Self {
+        Self {
+            window_micros: window_secs * 1_000_000,
+            entries: VecDeque::new(),
+            pv_sum:  0.0,
+            vol_sum: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, ts: i64, price: f64, volume: f64) {
+        let pv = price * volume;
+        self.pv_sum  += pv;
+        self.vol_sum += volume;
+        self.entries.push_back((ts, pv, volume));
+
+        let cutoff = ts - self.window_micros;
+        while self.entries.front().map_or(false, |e| e.0 < cutoff) {
+            let (_, old_pv, old_vol) = self.entries.pop_front().unwrap();
+            self.pv_sum  -= old_pv;
+            self.vol_sum -= old_vol;
+        }
+    }
+
+    #[inline]
+    pub fn vwap(&self) -> Option<f64> {
+        if self.vol_sum > 0.0 { Some(self.pv_sum / self.vol_sum) } else { None }
+    }
+
+    /// VWAP deviation normalised by an external volatility estimate.
+    /// Returns (price - vwap) / (vol_ref * price) — a dimensionless z-score.
+    #[inline]
+    pub fn deviation_z(&self, price: f64, vol_ref: f64) -> Option<f64> {
+        let vwap = self.vwap()?;
+        if vwap == 0.0 || vol_ref == 0.0 { return None; }
+        // Deviation as a fraction of price, then z-scored.
+        Some((price - vwap) / vwap / vol_ref)
+    }
+}
+
+// ─── Order flow imbalance (time-windowed, O(1)) ───────────────────────────────
+
+/// Rolling OFI in a real-time window with O(1) `value()`.
 pub struct OrderFlowImbalance {
     window_micros: i64,
     /// (ts_micros, buy_qty, sell_qty)
@@ -196,7 +271,6 @@ impl OrderFlowImbalance {
         self.evict_stale(tick.ts_micros - self.window_micros);
     }
 
-    /// Update from pre-aggregated buy/sell volumes (used by the fusion pipeline).
     pub fn update_fused(&mut self, ts: i64, buy_vol: f64, sell_vol: f64) {
         self.buy_sum  += buy_vol;
         self.sell_sum += sell_vol;
@@ -204,466 +278,501 @@ impl OrderFlowImbalance {
         self.evict_stale(ts - self.window_micros);
     }
 
-    /// O(1) — reads running sums directly.
+    /// (buy − sell) / (buy + sell) ∈ [−1, 1] — O(1).
     #[inline]
     pub fn value(&self) -> f64 {
         let total = self.buy_sum + self.sell_sum;
         if total == 0.0 { 0.0 } else { (self.buy_sum - self.sell_sum) / total }
     }
-}
 
-// ─── Return autocorrelation (lag-1) ─────────────────────────────────────────
-
-/// Incremental lag-1 Pearson autocorrelation of log-returns — O(1) per tick.
-///
-/// Maintains five running sums over the pair series (x[i] = r[i], y[i] = r[i+1]):
-///
-/// ```text
-///   sum_x  = Σ r[i]       (i = 0 .. n-2)
-///   sum_y  = Σ r[i+1]     (i = 0 .. n-2)
-///   sum_x2 = Σ r[i]²
-///   sum_y2 = Σ r[i+1]²
-///   sum_xy = Σ r[i]·r[i+1]
-/// ```
-///
-/// When the oldest return `r_old` leaves the window the pair `(r_old, r_next)`
-/// is removed from {sum_x, sum_xy, sum_x2}, and the pair `(r_prev_new_head,
-/// r_new_head)` is added to {sum_y, sum_xy, sum_y2} as the new tail pair.
-/// Concretely, the window of *pairs* shrinks by one at the front (x-side) and
-/// the new head of the returns window becomes the x of the only surviving pair
-/// that was previously an interior pair — which is already accounted for.
-///
-/// The simpler bookkeeping: think of the pair window as the `returns` deque
-/// minus its last element (x-series) and minus its first element (y-series).
-/// On push we add one pair; on pop we remove one pair.
-pub struct ReturnAutocorr {
-    window:  usize,
-    returns: VecDeque<f64>,
-    prev:    Option<f64>,
-    // Running sums over the pair series of length (n-1)
-    sum_x:   f64,
-    sum_y:   f64,
-    sum_x2:  f64,
-    sum_y2:  f64,
-    sum_xy:  f64,
-}
-
-impl ReturnAutocorr {
-    pub fn new(window: usize) -> Self {
-        Self {
-            window,
-            returns: VecDeque::with_capacity(window + 1),
-            prev:    None,
-            sum_x:   0.0,
-            sum_y:   0.0,
-            sum_x2:  0.0,
-            sum_y2:  0.0,
-            sum_xy:  0.0,
-        }
-    }
-
-    pub fn update(&mut self, price: f64) {
-        if let Some(p) = self.prev {
-            if p > 0.0 {
-                let r = (price / p).ln();
-
-                // The new return pairs with the current tail as (tail, r).
-                if let Some(&tail) = self.returns.back() {
-                    self.sum_x  += tail;
-                    self.sum_y  += r;
-                    self.sum_x2 += tail * tail;
-                    self.sum_y2 += r * r;
-                    self.sum_xy += tail * r;
-                }
-
-                self.returns.push_back(r);
-
-                // Evict the oldest return when the window is full.
-                if self.returns.len() > self.window {
-                    let evicted = self.returns.pop_front().unwrap();
-                    // The pair (evicted, next_head) leaves the x-side.
-                    if let Some(&next_head) = self.returns.front() {
-                        self.sum_x  -= evicted;
-                        self.sum_y  -= next_head;
-                        self.sum_x2 -= evicted * evicted;
-                        self.sum_y2 -= next_head * next_head;
-                        self.sum_xy -= evicted * next_head;
-                    }
-                }
-            }
-        }
-        self.prev = Some(price);
-    }
-
-    /// Pearson correlation between r[t] and r[t-1] — O(1).
+    /// buy / (buy + sell) ∈ [0, 1] — O(1).
     #[inline]
-    pub fn value(&self) -> Option<f64> {
-        let n = self.returns.len();
-        if n < 4 { return None; }
-        let m = (n - 1) as f64; // number of pairs
+    pub fn buy_ratio(&self) -> f64 {
+        let total = self.buy_sum + self.sell_sum;
+        if total == 0.0 { 0.5 } else { self.buy_sum / total }
+    }
 
-        // population Pearson over the pair series
-        let var_x = self.sum_x2 - self.sum_x * self.sum_x / m;
-        let var_y = self.sum_y2 - self.sum_y * self.sum_y / m;
-        let cov   = self.sum_xy - self.sum_x * self.sum_y / m;
-
-        let denom = (var_x * var_y).sqrt();
-        if denom == 0.0 { None } else { Some((cov / denom).clamp(-1.0, 1.0)) }
+    /// Total volume observed in the window.
+    #[inline]
+    pub fn total_volume(&self) -> f64 {
+        self.buy_sum + self.sell_sum
     }
 }
 
-// ─── Realised volatility ─────────────────────────────────────────────────────
+// ─── Tick velocity ────────────────────────────────────────────────────────────
 
-/// Rolling realised volatility (std of log-returns over a window) — O(1) per tick.
-///
-/// Maintains `sum` (Σ r) and `sum_sq` (Σ r²) so that `value()` computes the
-/// sample standard deviation without any allocation or window scan:
-///
-/// ```text
-/// variance = (sum_sq − sum² / n) / (n − 1)
-/// ```
-pub struct RealisedVol {
+/// Rolling tick rate (events per second) in a real-time window.
+pub struct TickVelocity {
     window_micros: i64,
-    entries: VecDeque<(i64, f64)>,
-    prev:    Option<(i64, f64)>,
-    sum:     f64,
-    sum_sq:  f64,
+    buf: VecDeque<i64>,
 }
 
-impl RealisedVol {
+impl TickVelocity {
     pub fn new(window_secs: i64) -> Self {
+        Self { window_micros: window_secs * 1_000_000, buf: VecDeque::new() }
+    }
+
+    pub fn update(&mut self, ts: i64) {
+        self.buf.push_back(ts);
+        let cutoff = ts - self.window_micros;
+        while self.buf.front().map_or(false, |&t| t < cutoff) { self.buf.pop_front(); }
+    }
+
+    pub fn rate(&self) -> f64 {
+        let n = self.buf.len();
+        if n < 2 { return 0.0; }
+        let span = (self.buf.back().unwrap() - self.buf.front().unwrap()) as f64 / 1_000_000.0;
+        if span == 0.0 { 0.0 } else { (n as f64 - 1.0) / span }
+    }
+}
+
+/// Maintains two tick-velocity windows to produce an activity-regime ratio.
+pub struct ActivityRegime {
+    fast:  TickVelocity,
+    slow:  TickVelocity,
+}
+
+impl ActivityRegime {
+    pub fn new() -> Self {
         Self {
-            window_micros: window_secs * 1_000_000,
-            entries: VecDeque::new(),
-            prev:    None,
-            sum:     0.0,
-            sum_sq:  0.0,
+            fast: TickVelocity::new(30),
+            slow: TickVelocity::new(1800),
         }
     }
 
-    #[inline]
-    fn push_return(&mut self, ts: i64, r: f64) {
-        self.sum    += r;
-        self.sum_sq += r * r;
-        self.entries.push_back((ts, r));
+    pub fn update(&mut self, ts: i64) {
+        self.fast.update(ts);
+        self.slow.update(ts);
     }
 
-    #[inline]
-    fn evict_stale(&mut self, cutoff: i64) {
-        while self.entries.front().map_or(false, |e| e.0 < cutoff) {
-            let (_, r) = self.entries.pop_front().unwrap();
-            self.sum    -= r;
-            self.sum_sq -= r * r;
-        }
+    /// tick_rate_30s / tick_rate_1800s.  Values > 1 indicate a burst of activity.
+    pub fn ratio(&self) -> f64 {
+        let slow = self.slow.rate();
+        if slow == 0.0 { 1.0 } else { self.fast.rate() / slow }
     }
 
-    pub fn update(&mut self, tick: &Tick) {
-        if let Some((_, pp)) = self.prev {
-            if pp > 0.0 {
-                let r = (tick.price / pp).ln();
-                self.push_return(tick.ts_micros, r);
-                self.evict_stale(tick.ts_micros - self.window_micros);
-            }
-        }
-        self.prev = Some((tick.ts_micros, tick.price));
-    }
-
-    /// Update from a fused canonical price (used by the fusion pipeline).
-    pub fn update_fused(&mut self, ts: i64, price: f64) {
-        if let Some((_, pp)) = self.prev {
-            if pp > 0.0 {
-                let r = (price / pp).ln();
-                self.push_return(ts, r);
-                self.evict_stale(ts - self.window_micros);
-            }
-        }
-        self.prev = Some((ts, price));
-    }
-
-    /// Sample standard deviation of log-returns — O(1).
-    #[inline]
-    pub fn value(&self) -> Option<f64> {
-        let n = self.entries.len();
-        if n < 3 { return None; }
-        let nf = n as f64;
-        let variance = (self.sum_sq - self.sum * self.sum / nf) / (nf - 1.0);
-        // Guard against tiny negative values from floating-point cancellation.
-        Some(variance.max(0.0).sqrt())
-    }
+    pub fn fast_rate(&self) -> f64 { self.fast.rate() }
 }
 
-// ─── Order book imbalance tracker ───────────────────────────────────────────
+// ─── Book imbalance tracker ───────────────────────────────────────────────────
 
-/// Tracks the latest top-N book imbalance per exchange and fuses them into a
-/// single cross-exchange estimate.
-///
-/// Imbalance decays to `None` after [`BOOK_STALE_MICROS`] without an update —
-/// a stale snapshot is worse than no snapshot for short-timescale features.
+/// Tracks the latest book imbalances (top-5 and full) per exchange and
+/// fuses them into single cross-exchange estimates.
 pub struct BookImbalanceTracker {
-    /// (imbalance ∈ [−1,1], received_at_micros) per exchange.
-    last: HashMap<Exchange, (f64, i64)>,
+    /// (imb_top5, imb_full, received_at_micros) per exchange.
+    last: HashMap<Exchange, (f64, f64, i64)>,
 }
 
-/// A book snapshot older than this is considered stale and excluded from the
-/// fused imbalance calculation.
 const BOOK_STALE_MICROS: i64 = 2_000_000; // 2 s
 
 impl BookImbalanceTracker {
     pub fn new() -> Self { Self { last: HashMap::new() } }
 
-    /// Record a new snapshot for one exchange.
-    pub fn update(&mut self, exchange: Exchange, imbalance: f64, ts_micros: i64) {
-        self.last.insert(exchange, (imbalance, ts_micros));
+    /// Record top-5 and full-depth imbalances from one exchange snapshot.
+    pub fn update(&mut self, exchange: Exchange, imb_top5: f64, imb_full: f64, ts_micros: i64) {
+        self.last.insert(exchange, (imb_top5, imb_full, ts_micros));
     }
 
-    /// Simple (bid_vol − ask_vol) imbalance for the most recent snapshot from
-    /// `exchange`. Returns `None` if no snapshot has been received or the
-    /// latest is stale.
-    pub fn latest_for(&self, exchange: Exchange, now_micros: i64) -> Option<f64> {
-        self.last.get(&exchange).and_then(|&(imb, ts)| {
-            if now_micros - ts <= BOOK_STALE_MICROS { Some(imb) } else { None }
-        })
-    }
-
-    /// Volume-averaged imbalance across all exchanges with a fresh snapshot.
-    ///
-    /// Returns `None` if no exchange has a fresh snapshot.
-    ///
-    /// Accumulates into stack variables — no heap allocation.
-    pub fn fused_imbalance(&self, now_micros: i64) -> Option<f64> {
+    /// Fused top-5 imbalance across all fresh snapshots.
+    pub fn fused_top5(&self, now_micros: i64) -> Option<f64> {
         let (mut total, mut count) = (0.0_f64, 0u32);
-        for &(imb, ts) in self.last.values() {
-            if now_micros - ts <= BOOK_STALE_MICROS {
-                total += imb;
-                count += 1;
-            }
+        for &(imb5, _, ts) in self.last.values() {
+            if now_micros - ts <= BOOK_STALE_MICROS { total += imb5; count += 1; }
+        }
+        if count == 0 { None } else { Some(total / count as f64) }
+    }
+
+    /// Fused full-depth imbalance across all fresh snapshots.
+    pub fn fused_full(&self, now_micros: i64) -> Option<f64> {
+        let (mut total, mut count) = (0.0_f64, 0u32);
+        for &(_, imb_full, ts) in self.last.values() {
+            if now_micros - ts <= BOOK_STALE_MICROS { total += imb_full; count += 1; }
         }
         if count == 0 { None } else { Some(total / count as f64) }
     }
 }
 
-// ─── Inter-exchange spread tracker ───────────────────────────────────────────
+// ─── Book spread / pressure tracker ──────────────────────────────────────────
 
-/// Tracks last price per exchange and computes the spread between them.
-pub struct InterExchangeSpread { last: HashMap<Exchange, f64> }
+/// Tracks per-exchange book spread (in USD) and micro-price deviation.
+///
+/// Produces percentage spread and a normalised "pressure" metric that
+/// captures micro-price vs. mid-price deviations — a cheap proxy for
+/// short-term order-book skew.
+pub struct BookPressureTracker {
+    /// (spread_usd, microprice_dev, mid_price, ts_micros)
+    last: HashMap<Exchange, (f64, f64, f64, i64)>,
+}
 
-impl InterExchangeSpread {
+impl BookPressureTracker {
     pub fn new() -> Self { Self { last: HashMap::new() } }
-    pub fn update(&mut self, tick: &Tick) { self.last.insert(tick.exchange, tick.price); }
-    /// Max price − min price across all exchanges that have reported.
-    pub fn spread(&self) -> f64 {
-        if self.last.len() < 2 { return 0.0; }
-        let (min, max) = self.last.values().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &p| (lo.min(p), hi.max(p)));
-        max - min
+
+    /// Record a snapshot's spread and micro-price deviation.
+    ///
+    /// `microprice_dev = (microprice − mid) / mid` — positive when bids dominate.
+    pub fn update(
+        &mut self, exchange: Exchange,
+        spread_usd: f64, microprice_dev: f64, mid: f64, ts: i64,
+    ) {
+        self.last.insert(exchange, (spread_usd, microprice_dev, mid, ts));
+    }
+
+    /// Volume-averaged percentage spread across fresh snapshots.
+    pub fn spread_pct(&self, now_micros: i64) -> Option<f64> {
+        let (mut num, mut count) = (0.0_f64, 0u32);
+        for &(spread_usd, _, mid, ts) in self.last.values() {
+            if now_micros - ts <= BOOK_STALE_MICROS && mid > 0.0 {
+                num += spread_usd / mid;
+                count += 1;
+            }
+        }
+        if count == 0 { None } else { Some(num / count as f64) }
+    }
+
+    /// Average micro-price deviation across fresh snapshots.
+    pub fn pressure(&self, now_micros: i64) -> Option<f64> {
+        let (mut total, mut count) = (0.0_f64, 0u32);
+        for &(_, mp_dev, _, ts) in self.last.values() {
+            if now_micros - ts <= BOOK_STALE_MICROS { total += mp_dev; count += 1; }
+        }
+        if count == 0 { None } else { Some(total / count as f64) }
     }
 }
 
-// ─── Composite feature vector ────────────────────────────────────────────────
+// ─── Composite feature vector ─────────────────────────────────────────────────
 
-/// All features at one tick instant. `None` = not yet seeded.
+/// All features at one fused-tick instant.
+///
+/// `None` means "accumulator not yet seeded" — callers should fill with a
+/// sensible default (e.g. 0.0 for signed features, 0.001 for volatility).
 #[derive(Debug, Clone)]
 pub struct FeatureVector {
-    pub ts_micros:             i64,
-    pub price:                 f64,
-    pub rsi_14:                Option<f64>,
-    pub vwap_deviation:        Option<f64>,
-    pub momentum_micro:        Option<f64>,
-    pub momentum_short:        Option<f64>,
-    pub ewma_vol_tick:         Option<f64>,
-    /// EWMA variance (for outlier filter feedback).
-    pub ewma_variance:         f64,
-    pub tick_velocity:         f64,
-    pub ofi_30s:               f64,
-    pub ofi_300s:              f64,
-    pub autocorr_lag1:         Option<f64>,
-    pub realised_vol_30s:      Option<f64>,
-    pub inter_exchange_spread: f64,
-    // ── Order book features (None when no book feed is connected) ────────────
-    /// Fused top-5 bid/ask volume imbalance across all exchanges with a live
-    /// book feed. ∈ [−1, 1]: +1 = fully bid-side, −1 = fully ask-side.
-    pub book_imbalance_top5:   Option<f64>,
-    /// Same, but over all [`BOOK_DEPTH`] levels available.
-    pub book_imbalance_full:   Option<f64>,
-    /// Weighted mid-price derived from the book (more stable than last trade).
-    /// `None` when no book is connected.
-    pub book_weighted_mid:     Option<f64>,
-    /// Best bid–ask spread in USD. `None` when no book is connected.
-    pub book_spread_usd:       Option<f64>,
+    pub ts_micros: i64,
+    pub price:     f64,
+
+    // ── Returns (time-horizon aligned) ───────────────────────────────────────
+    pub return_5s:   Option<f64>,
+    pub return_30s:  Option<f64>,
+    pub return_300s: Option<f64>,
+
+    // ── Volatility ────────────────────────────────────────────────────────────
+    pub vol_30s:    Option<f64>,
+    pub vol_300s:   Option<f64>,
+    pub vol_1800s:  Option<f64>,
+    /// vol_30s / vol_1800s — > 1 means volatility expansion.
+    pub vol_ratio:  Option<f64>,
+
+    // ── Order flow imbalance ──────────────────────────────────────────────────
+    pub ofi_5s:       f64,
+    pub ofi_30s:      f64,
+    pub ofi_300s:     f64,
+    /// ofi_5s − ofi_30s: positive when short-term flow is more aggressive than baseline.
+    pub ofi_delta_30s: f64,
+    pub buy_ratio_30s:  f64,
+    pub buy_ratio_300s: f64,
+
+    // ── VWAP deviation (z-scored by vol_1800s) ───────────────────────────────
+    pub vwap_dev_30s:  Option<f64>,
+    pub vwap_dev_300s: Option<f64>,
+
+    // ── Volume ────────────────────────────────────────────────────────────────
+    /// volume_30s / volume_300s — > 1 indicates unusually active recent window.
+    pub volume_ratio: Option<f64>,
+
+    // ── Tick activity ─────────────────────────────────────────────────────────
+    pub tick_velocity:    f64,
+    pub activity_regime:  f64,
+
+    // ── Cross-exchange spread (percentage) ───────────────────────────────────
+    pub spread_pct: f64,
+
+    // ── Order book features ───────────────────────────────────────────────────
+    pub book_imbalance_5:    Option<f64>,
+    pub book_imbalance_full: Option<f64>,
+    pub book_spread_pct:     Option<f64>,
+    pub book_pressure:       Option<f64>,
+
+    // ── Regime features ───────────────────────────────────────────────────────
+    /// abs(return_300s) / vol_1800s — trend strength, regime-normalised.
+    pub trend_strength: Option<f64>,
+    /// vol_300s / vol_1800s — > 1 means short-term vol above regime baseline.
+    pub vol_regime:     Option<f64>,
+
+    // ── Normalised (z-scored) returns — key for cross-regime generalisation ──
+    pub zreturn_30s:  Option<f64>,
+    pub zreturn_300s: Option<f64>,
+
+    // ── Retained for outlier-filter feedback path ─────────────────────────────
+    /// Variance estimate used by the dedup/outlier stage — kept as a convenience
+    /// field so the engine can pass it back without holding a separate handle.
+    pub vol_1800s_variance: f64,
 }
 
-// ─── Feature state ───────────────────────────────────────────────────────────
+// ─── Feature state ────────────────────────────────────────────────────────────
 
-/// Owns all incremental feature accumulators.
-///
-/// Updated by the engine hot-path on every accepted tick.
+/// Owns all incremental accumulators; updated on every accepted fused tick.
 pub struct FeatureState {
-    pub rsi:             IncrementalRsi,
-    pub vwap:            SessionVwap,
-    pub vol:             EwmaVolatility,
-    pub mom_micro:       RollingMomentum,
-    pub mom_short:       RollingMomentum,
-    pub velocity:        TickVelocity,
-    pub ofi_30:          OrderFlowImbalance,
-    pub ofi_300:         OrderFlowImbalance,
-    pub autocorr:        ReturnAutocorr,
-    pub realised_30:     RealisedVol,
-    pub spread:          InterExchangeSpread,
-    pub book_imbalance:  BookImbalanceTracker,
+    // Returns
+    ret_5s:   WindowedReturn,
+    ret_30s:  WindowedReturn,
+    ret_300s: WindowedReturn,
+    ret_1800s: WindowedReturn,
+
+    // Realised volatility
+    vol_30:   RealisedVol,
+    vol_300:  RealisedVol,
+    vol_1800: RealisedVol,
+
+    // Order flow imbalance
+    ofi_5:   OrderFlowImbalance,
+    ofi_30:  OrderFlowImbalance,
+    ofi_300: OrderFlowImbalance,
+
+    // Rolling VWAP
+    vwap_30:  RollingVwap,
+    vwap_300: RollingVwap,
+
+    // Volume accumulators (reuse OFI total_volume(), no extra state needed)
+    // ofi_30 and ofi_300 already track volume — volume_ratio derived from them.
+
+    // Tick activity / regime
+    activity: ActivityRegime,
+
+    // Order book
+    pub book_imbalance: BookImbalanceTracker,
+    pub book_pressure:  BookPressureTracker,
 }
 
 impl FeatureState {
     pub fn new() -> Self {
         Self {
-            rsi:            IncrementalRsi::new(14),
-            vwap:           SessionVwap::new(),
-            vol:            EwmaVolatility::default_lambda(),
-            mom_micro:      RollingMomentum::new(30),
-            mom_short:      RollingMomentum::new(300),
-            velocity:       TickVelocity::new(30),
-            ofi_30:         OrderFlowImbalance::new(30),
-            ofi_300:        OrderFlowImbalance::new(300),
-            autocorr:       ReturnAutocorr::new(60),
-            realised_30:    RealisedVol::new(30),
-            spread:         InterExchangeSpread::new(),
+            ret_5s:    WindowedReturn::new(5),
+            ret_30s:   WindowedReturn::new(30),
+            ret_300s:  WindowedReturn::new(300),
+            ret_1800s: WindowedReturn::new(1800),
+
+            vol_30:   RealisedVol::new(30),
+            vol_300:  RealisedVol::new(300),
+            vol_1800: RealisedVol::new(1800),
+
+            ofi_5:   OrderFlowImbalance::new(5),
+            ofi_30:  OrderFlowImbalance::new(30),
+            ofi_300: OrderFlowImbalance::new(300),
+
+            vwap_30:  RollingVwap::new(30),
+            vwap_300: RollingVwap::new(300),
+
+            activity: ActivityRegime::new(),
+
             book_imbalance: BookImbalanceTracker::new(),
+            book_pressure:  BookPressureTracker::new(),
         }
     }
 
-    /// Update all features from a tick and return the current vector.
-    ///
-    /// Used for direct tick injection (testing / replay) when the fusion stage
-    /// is bypassed.
-    pub fn update(&mut self, tick: &Tick) -> FeatureVector {
-        self.rsi.update(tick.price);
-        self.vwap.update(tick);
-        self.vol.update(tick.price);
-        self.mom_micro.update(tick.price);
-        self.mom_short.update(tick.price);
-        self.velocity.update(tick.ts_micros);
-        self.ofi_30.update(tick);
-        self.ofi_300.update(tick);
-        self.autocorr.update(tick.price);
-        self.realised_30.update(tick);
-        self.spread.update(tick);
-
-        let ts = tick.ts_micros;
-        FeatureVector {
-            ts_micros:             ts,
-            price:                 tick.price,
-            rsi_14:                self.rsi.value(),
-            vwap_deviation:        self.vwap.deviation(tick.price),
-            momentum_micro:        self.mom_micro.value(),
-            momentum_short:        self.mom_short.value(),
-            ewma_vol_tick:         self.vol.tick_vol(),
-            ewma_variance:         self.vol.variance,
-            tick_velocity:         self.velocity.rate(),
-            ofi_30s:               self.ofi_30.value(),
-            ofi_300s:              self.ofi_300.value(),
-            autocorr_lag1:         self.autocorr.value(),
-            realised_vol_30s:      self.realised_30.value(),
-            inter_exchange_spread: self.spread.spread(),
-            book_imbalance_top5:   self.book_imbalance.fused_imbalance(ts),
-            book_imbalance_full:   self.book_imbalance.fused_imbalance(ts),
-            book_weighted_mid:     None,
-            book_spread_usd:       None,
-        }
-    }
-
-    /// Record a new book snapshot and update the imbalance tracker.
-    ///
-    /// Called from the pipeline book stage on every [`BookSnapshot`].
-    /// Cheap: only updates the per-exchange imbalance entry; the full feature
-    /// vector is recomputed on the next `update_from_fused` call.
-    pub fn update_book(&mut self, snap: &crate::types::BookSnapshot) {
-        if let Some(imb) = snap.imbalance(5) {
-            self.book_imbalance.update(snap.exchange, imb, snap.ts_micros);
-        }
-    }
-
-    /// Update all features from a [`FusedTick`] — the primary hot-path entry
-    /// point in production.
-    ///
-    /// Uses the fused canonical price (volume-weighted across all exchanges)
-    /// rather than a single-exchange tick.  OFI and spread are taken directly
-    /// from the pre-computed [`FusedTick`] fields, which already aggregate
-    /// across all contributing exchanges.
+    /// Primary hot-path update — called on every [`FusedTick`].
     pub fn update_from_fused(&mut self, fused: &FusedTick) -> FeatureVector {
         let price = fused.price;
         let ts    = fused.ts_micros;
+        let vol   = fused.volume;
 
-        // Update price-derived features using the canonical fused price
-        self.rsi.update(price);
-        self.vol.update(price);
-        self.mom_micro.update(price);
-        self.mom_short.update(price);
-        self.velocity.update(ts);
-        self.autocorr.update(price);
+        // ── Realised vol (price-based, time-windowed) ─────────────────────────
+        self.vol_30.update_fused(ts, price);
+        self.vol_300.update_fused(ts, price);
+        self.vol_1800.update_fused(ts, price);
 
-        // Update VWAP accumulator using fused volume
-        self.vwap.update_fused(price, fused.volume);
+        // ── Returns — must come after vol so vol_1800s is fresh for z-scoring ─
+        let lp = if price > 0.0 { price.ln() } else { 0.0 };
+        self.ret_5s.update(ts, price);
+        self.ret_30s.update(ts, price);
+        self.ret_300s.update(ts, price);
+        self.ret_1800s.update(ts, price);
 
-        // Update OFI accumulators from fused buy_ratio + volume
-        // Distribute buy and sell volume into the OFI windows
+        // ── Order flow imbalance ─────────────────────────────────────────────
         if let Some(buy_ratio) = fused.buy_ratio {
-            let buy_vol  = fused.volume * buy_ratio;
-            let sell_vol = fused.volume * (1.0 - buy_ratio);
+            let buy_vol  = vol * buy_ratio;
+            let sell_vol = vol * (1.0 - buy_ratio);
+            self.ofi_5.update_fused(ts, buy_vol, sell_vol);
             self.ofi_30.update_fused(ts, buy_vol, sell_vol);
             self.ofi_300.update_fused(ts, buy_vol, sell_vol);
         }
 
-        // Update realised vol accumulator
-        self.realised_30.update_fused(ts, price);
+        // ── VWAP ─────────────────────────────────────────────────────────────
+        self.vwap_30.update(ts, price, vol);
+        self.vwap_300.update(ts, price, vol);
 
-        // Inter-exchange spread is already computed by the fuser
-        // No need to re-track; read it directly from FusedTick
+        // ── Tick activity / regime ────────────────────────────────────────────
+        self.activity.update(ts);
 
+        // ── Derived scalars ───────────────────────────────────────────────────
+        let vol_30s   = self.vol_30.value();
+        let vol_300s  = self.vol_300.value();
+        let vol_1800s = self.vol_1800.value();
+
+        let vol_ratio = vol_1800s.and_then(|v1800| {
+            if v1800 == 0.0 { None } else { vol_30s.map(|v30| v30 / v1800) }
+        });
+        let vol_regime = vol_1800s.and_then(|v1800| {
+            if v1800 == 0.0 { None } else { vol_300s.map(|v300| v300 / v1800) }
+        });
+
+        let return_5s   = self.ret_5s.value(lp);
+        let return_30s  = self.ret_30s.value(lp);
+        let return_300s = self.ret_300s.value(lp);
+        let return_1800s = self.ret_1800s.value(lp);
+
+        // z-scored returns: divide by vol_1800s to normalise across price regimes.
+        let zreturn_30s = vol_1800s.and_then(|v| {
+            if v == 0.0 { None } else { return_30s.map(|r| r / v) }
+        });
+        let zreturn_300s = vol_1800s.and_then(|v| {
+            if v == 0.0 { None } else { return_300s.map(|r| r / v) }
+        });
+
+        let trend_strength = vol_1800s.and_then(|v| {
+            if v == 0.0 { None }
+            else { return_300s.map(|r| r.abs() / v) }
+        });
+
+        let ofi_5s  = self.ofi_5.value();
+        let ofi_30s = self.ofi_30.value();
+        let ofi_delta_30s = ofi_5s - ofi_30s;
+
+        let vwap_dev_30s  = vol_1800s.and_then(|v| self.vwap_30.deviation_z(price, v));
+        let vwap_dev_300s = vol_1800s.and_then(|v| self.vwap_300.deviation_z(price, v));
+
+        // Volume ratio: recent / baseline activity.
+        let vol_30_total  = self.ofi_30.total_volume();
+        let vol_300_total = self.ofi_300.total_volume();
+        let volume_ratio = if vol_300_total == 0.0 { None }
+            else { Some(vol_30_total / vol_300_total) };
+
+        // Cross-exchange spread as a percentage of mid price.
+        let spread_pct = fused.spread_pct();
+
+        let ts_now = ts;
         FeatureVector {
-            ts_micros:             ts,
+            ts_micros: ts,
             price,
-            rsi_14:                self.rsi.value(),
-            vwap_deviation:        self.vwap.deviation(price),
-            momentum_micro:        self.mom_micro.value(),
-            momentum_short:        self.mom_short.value(),
-            ewma_vol_tick:         self.vol.tick_vol(),
-            ewma_variance:         self.vol.variance,
-            tick_velocity:         self.velocity.rate(),
-            ofi_30s:               self.ofi_30.value(),
-            ofi_300s:              self.ofi_300.value(),
-            autocorr_lag1:         self.autocorr.value(),
-            realised_vol_30s:      self.realised_30.value(),
-            // Use the fuser's pre-computed cross-exchange spread directly
-            inter_exchange_spread: fused.cross_exchange_spread,
-            // Book features populated if any book feed has sent a fresh snapshot
-            book_imbalance_top5:   self.book_imbalance.fused_imbalance(ts),
-            book_imbalance_full:   self.book_imbalance.fused_imbalance(ts),
-            book_weighted_mid:     None,
-            book_spread_usd:       None,
+
+            return_5s,
+            return_30s,
+            return_300s,
+
+            vol_30s,
+            vol_300s,
+            vol_1800s,
+            vol_ratio,
+
+            ofi_5s,
+            ofi_30s,
+            ofi_300s:      self.ofi_300.value(),
+            ofi_delta_30s,
+            buy_ratio_30s:  self.ofi_30.buy_ratio(),
+            buy_ratio_300s: self.ofi_300.buy_ratio(),
+
+            vwap_dev_30s,
+            vwap_dev_300s,
+
+            volume_ratio,
+
+            tick_velocity:   self.activity.fast_rate(),
+            activity_regime: self.activity.ratio(),
+
+            spread_pct,
+
+            book_imbalance_5:    self.book_imbalance.fused_top5(ts_now),
+            book_imbalance_full: self.book_imbalance.fused_full(ts_now),
+            book_spread_pct:     self.book_pressure.spread_pct(ts_now),
+            book_pressure:       self.book_pressure.pressure(ts_now),
+
+            trend_strength,
+            vol_regime,
+
+            zreturn_30s,
+            zreturn_300s,
+
+            vol_1800s_variance: self.vol_1800.value().map(|v| v * v).unwrap_or(0.0),
+        }
+    }
+
+    /// Update book-derived features from a [`BookSnapshot`].
+    ///
+    /// Called by the pipeline book stage; does not emit a `FeatureVector`.
+    pub fn update_book(&mut self, snap: &crate::types::BookSnapshot) {
+        let ts = snap.ts_micros;
+
+        let imb5    = snap.imbalance(5);
+        let imb_full = snap.imbalance(snap.bids.len().max(snap.asks.len()));
+
+        if let (Some(i5), Some(ifull)) = (imb5, imb_full) {
+            self.book_imbalance.update(snap.exchange, i5, ifull, ts);
+        }
+
+        if let (Some(spread_usd), Some(mid), Some(microprice)) = (
+            snap.spread_usd(),
+            snap.mid_price(),
+            snap.weighted_mid(5),
+        ) {
+            let mp_dev = if mid > 0.0 { (microprice - mid) / mid } else { 0.0 };
+            self.book_pressure.update(snap.exchange, spread_usd, mp_dev, mid, ts);
         }
     }
 }
 
 impl Default for FeatureState { fn default() -> Self { Self::new() } }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test] fn rsi_seeding() {
-        let mut r = IncrementalRsi::new(14);
-        for _ in 0..13 { assert!(r.update(100.0).is_none()); }
-        assert!(r.update(100.0).is_some());
+    #[test]
+    fn windowed_return_fills_then_reads() {
+        let mut wr = WindowedReturn::new(30);
+        let base_ts = 0_i64;
+        // Feed 35 seconds of prices at 1 Hz.
+        for i in 0..=35_i64 {
+            wr.update(base_ts + i * 1_000_000, 100.0 + i as f64);
+        }
+        // Should now have a valid 30-second return.
+        let lp_now = (135.0_f64).ln();
+        assert!(wr.value(lp_now).is_some());
     }
 
-    #[test] fn momentum_window() {
-        let mut m = RollingMomentum::new(3);
-        m.update(100.0); m.update(110.0); m.update(120.0);
-        assert!(m.value().is_none()); // window=3 needs 4 prices
-        m.update(130.0);
-        let v = m.value().unwrap();
-        assert!((v - 0.3).abs() < 1e-9);
+    #[test]
+    fn windowed_return_not_ready_during_warmup() {
+        let mut wr = WindowedReturn::new(30);
+        // Only 10 seconds of history — should not return a value.
+        for i in 0..=10_i64 {
+            wr.update(i * 1_000_000, 100.0 + i as f64);
+        }
+        let lp_now = (110.0_f64).ln();
+        assert!(wr.value(lp_now).is_none());
     }
 
-    #[test] fn ofi_balanced() {
+    #[test]
+    fn realised_vol_seeding() {
+        let mut rv = RealisedVol::new(30);
+        // < 3 returns → None
+        rv.update_fused(0, 100.0);
+        rv.update_fused(1_000_000, 101.0);
+        assert!(rv.value().is_none());
+        rv.update_fused(2_000_000, 102.0);
+        assert!(rv.value().is_some());
+    }
+
+    #[test]
+    fn rolling_vwap_basic() {
+        let mut vwap = RollingVwap::new(30);
+        vwap.update(0, 100.0, 1.0);
+        vwap.update(1_000_000, 200.0, 1.0);
+        // VWAP should be (100 + 200) / 2 = 150.
+        assert!((vwap.vwap().unwrap() - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ofi_balanced() {
         let mut ofi = OrderFlowImbalance::new(60);
         let mk = |side: TradeSide| Tick {
             ts_micros: 0, price: 50_000.0, quantity: 1.0, side: Some(side),
@@ -672,16 +781,34 @@ mod tests {
         ofi.update(&mk(TradeSide::Buy));
         ofi.update(&mk(TradeSide::Sell));
         assert!((ofi.value()).abs() < 1e-9);
+        assert!((ofi.buy_ratio() - 0.5).abs() < 1e-9);
     }
 
-    #[test] fn spread_two_exchanges() {
-        let mut s = InterExchangeSpread::new();
-        let t = |ex: Exchange, p: f64| Tick {
-            ts_micros: 0, price: p, quantity: 0.1, side: None,
-            exchange: ex, symbol: crate::types::Symbol::BtcUsd, trade_id: "x".into(),
-        };
-        s.update(&t(Exchange::Binance, 50_010.0));
-        s.update(&t(Exchange::Kraken,  50_000.0));
-        assert!((s.spread() - 10.0).abs() < 1e-6);
+    #[test]
+    fn book_imbalance_tracker_staleness() {
+        let mut tracker = BookImbalanceTracker::new();
+        tracker.update(Exchange::Binance, 0.4, 0.3, 0);
+        // Fresh at t=0
+        assert!(tracker.fused_top5(0).is_some());
+        // Stale after BOOK_STALE_MICROS + 1
+        assert!(tracker.fused_top5(BOOK_STALE_MICROS + 1).is_none());
+    }
+
+    #[test]
+    fn activity_regime_burst() {
+        let mut ar = ActivityRegime::new();
+        // Seed 1800 s of slow activity (1 tick / 10 s).
+        for i in 0..=180_i64 {
+            ar.update(i * 10_000_000);
+        }
+        let slow_ratio = ar.ratio();
+        // Now burst 30 s of fast activity (10 ticks / s).
+        let base = 1_800_000_000_i64;
+        for i in 0..300_i64 {
+            ar.update(base + i * 100_000);
+        }
+        let fast_ratio = ar.ratio();
+        // Fast ratio should be substantially > slow ratio.
+        assert!(fast_ratio > slow_ratio);
     }
 }
